@@ -112,7 +112,7 @@ function PostBeginPlay()
         // logging starts enabled (throttled to once per attempt-cooldown,
         // not per Timer tick) so it can be watched during this playtest -
         // flip to false in BotsMut.ini once confirmed working.
-        bDebugGrapple = true;
+        bDebugGrapple = false;
         MaxZedsForFailsafe = 3;
         FailsafeActivationDelay = 8.0;
 
@@ -1037,4 +1037,4 @@ defaultproperties
     // properties, which the compiler will not import from this block.
     // Their defaults (6 / 25 / 1.0 / 0.2) are applied in PostBeginPlay().
     MaxEmoteCount=-1
-}
+}
