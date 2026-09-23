@@ -29,11 +29,8 @@ var KFInventoryManager KFInvManager;
 var KFGameReplicationInfo KFGRI;
 var transient KFWeap_HealerBase MedicGun;
 var transient KFWeap_MedicBase RangeMedicGun;
-<<<<<<< HEAD
-=======
 var transient bool bHealFired;
 var transient float LastHealFireTime;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
 var transient float LastCallTimer;
 var transient float EndMoveTime;
 var transient float SerpentineTime;
@@ -102,6 +99,10 @@ function InitPlayerReplicationInfo()
 {
     super(Controller).InitPlayerReplicationInfo();
     // End:0x39
+    if(PlayerReplicationInfo != none)
+    {
+        PlayerReplicationInfo.bBot = false;
+    }
     if(mut != none)
     {
         mut.InitBotCharacter(self);
@@ -1510,21 +1511,6 @@ function NotifyAddInventory(Inventory NewItem)
 
 final function bool CheckShouldHealMate()
 {
-<<<<<<< HEAD
-    local KFPawn_Human P;
-
-    // End:0x5D
-    foreach KFInvManager.InventoryActors(Class'KFGame.KFWeap_HealerBase', MedicGun)
-    {
-        // End:0x5C
-        if(MedicGun.HasAmmo(0))
-        {
-            // End:0x5D
-            break;
-        }        
-    }    
-    // End:0x6F
-=======
     local KFWeap_HealerBase W;
     local KFPawn_Human P, Best;
     local float Pct, BestPct, DHoriz, DVert;
@@ -1541,31 +1527,16 @@ final function bool CheckShouldHealMate()
     MedicGun = none;
     foreach KFInvManager.InventoryActors(Class'KFGame.KFWeap_HealerBase', W)
     {
-        if(W.HasAmmo(1))
+        if(W.HasAmmo(0))
         {
             MedicGun = W;
             break;
         }
     }
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     if(MedicGun == none)
     {
         return false;
     }
-<<<<<<< HEAD
-    // End:0x143
-    foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Human', P, Pawn.Location, 1000.0000000)
-    {
-        // End:0x142
-        if((((P != Pawn) && P.Health > 0) && TargetLowHealth(P)) && ActorReachable(P))
-        {
-            PendingHeal = P;            
-            return true;
-        }        
-    }    
-    return false;
-    //return ReturnValue;    
-=======
 
     Best = none;
     BestPct = 0.0000000;
@@ -1619,33 +1590,10 @@ final function bool CheckShouldHealMate()
 
     PendingHeal = Best;
     return Best != none;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
 }
 
 final function bool CheckMedicGunHeal()
 {
-<<<<<<< HEAD
-    local KFPawn_Human P;
-
-    RangeMedicGun = KFWeap_MedicBase(Pawn.Weapon);
-    // End:0x6B
-    if((RangeMedicGun == none) || !RangeMedicGun.HasAmmo(1))
-    {
-        return false;
-    }
-    // End:0x174
-    foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Human', P, Pawn.Location, 1800.0000000)
-    {
-        // End:0x173
-        if((((P != Pawn) && P.Health > 0) && TargetLowHealth(P)) && FastTrace(Pawn.Location, P.Location))
-        {
-            PendingHeal = P;            
-            return true;
-        }        
-    }    
-    return false;
-    //return ReturnValue;    
-=======
     local KFPawn_Human P, Best;
     local float Pct, BestPct;
 
@@ -1706,24 +1654,10 @@ final function bool CheckMedicGunHeal()
 
     PendingHeal = Best;
     return Best != none;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
 }
 
 final function bool CheckShouldSelfHeal()
 {
-<<<<<<< HEAD
-    // End:0x5D
-    foreach KFInvManager.InventoryActors(Class'KFGame.KFWeap_HealerBase', MedicGun)
-    {
-        // End:0x5C
-        if(MedicGun.HasAmmo(1))
-        {            
-            return true;
-        }        
-    }    
-    return false;
-    //return ReturnValue;    
-=======
     local KFWeap_HealerBase W;
     local float Pct;
 
@@ -1756,7 +1690,6 @@ final function bool CheckShouldSelfHeal()
         }
     }
     return MedicGun != none;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
 }
 
 final function bool ShouldNadeEnemies()
@@ -2947,66 +2880,23 @@ state HealingSelf
     {
         AbortMove();
         HealingStage = 0;
-<<<<<<< HEAD
-        SetTimer(0.1000000, true);
-        //return;        
-=======
         bHealFired = false;
         LastHealFireTime = 0.0000000;
         SetTimer(0.1000000, true);
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     event EndState(name NextStateName)
     {
         SetTimer(0.0000000, false);
-<<<<<<< HEAD
-        //return;        
-=======
         bHealFired = false;
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function Timer()
     {
-<<<<<<< HEAD
-        switch(HealingStage)
-        {
-            // End:0xF9
-            case 0:
-                // End:0xB9
-                if(Pawn.Weapon == MedicGun)
-                {
-                    Pawn.StopFiring();
-                    // End:0xB6
-                    if(!MedicGun.IsInState('WeaponEquipping'))
-                    {
-                        MedicGun.StartFire(1);
-                        ++HealingStage;
-                    }                    
-                }
-                else
-                {
-                    Pawn.InvManager.SetCurrentWeapon(MedicGun);
-                }
-                // End:0x12D
-                break;
-            // End:0x12A
-            case 1:
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                // End:0x12D
-                break;
-            // End:0xFFFF
-            default:
-                break;
-        }
-        //return;        
-=======
         local float Pct;
 
         if(mut == none)
@@ -3060,23 +2950,14 @@ state HealingSelf
             default:
                 break;
         }
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function FinishedMove()
     {
         PickRetreatMove();
-<<<<<<< HEAD
-        //return;        
     }
 Begin:
 
-    // End:0x2D
-=======
-    }
-Begin:
-
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     if(Pawn.Physics == 2)
     {
         WaitForLanding();
@@ -3091,88 +2972,33 @@ state HealOther
     {
         AbortMove();
         HealingStage = 0;
-<<<<<<< HEAD
-        SetTimer(0.1000000, true);
-        SetTimer(2.0000000, false, 'TimeOut');
-        //return;        
-=======
         bHealFired = false;
         LastHealFireTime = 0.0000000;
         SetTimer(0.1000000, true);
         SetTimer(2.0000000, false, 'TimeOut');
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     event EndState(name NextStateName)
     {
         SetTimer(0.0000000, false);
         ClearTimer('TimeOut');
-<<<<<<< HEAD
-        // End:0x4D
-=======
         bHealFired = false;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
-<<<<<<< HEAD
-        //return;        
-=======
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function Timer()
     {
-<<<<<<< HEAD
-        // End:0x79
-        if((((PendingHeal == none) || !PendingHeal.IsAliveAndWell()) || !TargetLowHealth(PendingHeal)) || !ActorReachable(PendingHeal))
-=======
         local float Pct, DHoriz, DVert;
 
         if(mut == none)
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
         {
             PendingHeal = none;
             PickCombatStyle();
             return;
         }
-<<<<<<< HEAD
-        switch(HealingStage)
-        {
-            // End:0x198
-            case 0:
-                // End:0x158
-                if(Pawn.Weapon == MedicGun)
-                {
-                    Focus = PendingHeal;
-                    Target = PendingHeal;
-                    Pawn.StopFiring();
-                    // End:0x155
-                    if(!MedicGun.IsInState('WeaponEquipping'))
-                    {
-                        MedicGun.StartFire(0);
-                        ++HealingStage;
-                    }                    
-                }
-                else
-                {
-                    Pawn.InvManager.SetCurrentWeapon(MedicGun);
-                }
-                // End:0x1CC
-                break;
-            // End:0x1C9
-            case 1:
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                // End:0x1CC
-                break;
-            // End:0xFFFF
-            default:
-                break;
-        }
-        //return;        
-=======
         if((PendingHeal == none) || !PendingHeal.IsAliveAndWell())
         {
             PendingHeal = none;
@@ -3215,7 +3041,7 @@ state HealOther
         switch(HealingStage)
         {
             case 0:
-                if((MedicGun == none) || !MedicGun.HasAmmo(1))
+                if((MedicGun == none) || !MedicGun.HasAmmo(0))
                 {
                     PendingHeal = none;
                     PickCombatStyle();
@@ -3233,7 +3059,7 @@ state HealOther
                 {
                     return;
                 }
-                MedicGun.StartFire(1);
+                MedicGun.StartFire(0);
                 bHealFired = true;
                 LastHealFireTime = WorldInfo.TimeSeconds;
                 ++HealingStage;
@@ -3249,32 +3075,19 @@ state HealOther
             default:
                 break;
         }
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function FinishedMove()
     {
         MoveTowardX(PendingHeal);
-<<<<<<< HEAD
-        //return;        
-=======
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function TimeOut()
     {
         PickCombatStyle();
-<<<<<<< HEAD
-        //return;        
     }
 Begin:
 
-    // End:0x2D
-=======
-    }
-Begin:
-
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     if(Pawn.Physics == 2)
     {
         WaitForLanding();
@@ -3291,88 +3104,33 @@ state HealRanged
     {
         AbortMove();
         HealingStage = 0;
-<<<<<<< HEAD
-        SetTimer(0.0000000, false);
-        SetTimer(2.0000000, false, 'TimeOut');
-        //return;        
-=======
         bHealFired = false;
         LastHealFireTime = 0.0000000;
         SetTimer(0.1000000, true);
         SetTimer(2.0000000, false, 'TimeOut');
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     event EndState(name NextStateName)
     {
         SetTimer(0.0000000, false);
         ClearTimer('TimeOut');
-<<<<<<< HEAD
-        // End:0x4D
-=======
         bHealFired = false;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
-<<<<<<< HEAD
-        //return;        
-=======
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function Timer()
     {
-<<<<<<< HEAD
-        // End:0xAE
-        if((((PendingHeal == none) || !PendingHeal.IsAliveAndWell()) || !TargetLowHealth(PendingHeal)) || !FastTrace(PendingHeal.Location, Pawn.Location))
-=======
         local float Pct;
 
         if(mut == none)
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
         {
             PendingHeal = none;
             PickCombatStyle();
             return;
         }
-<<<<<<< HEAD
-        switch(HealingStage)
-        {
-            // End:0x1CD
-            case 0:
-                // End:0x18D
-                if(Pawn.Weapon == RangeMedicGun)
-                {
-                    Focus = PendingHeal;
-                    Target = PendingHeal;
-                    Pawn.StopFiring();
-                    // End:0x18A
-                    if(!RangeMedicGun.IsInState('WeaponEquipping'))
-                    {
-                        RangeMedicGun.StartFire(1);
-                        ++HealingStage;
-                    }                    
-                }
-                else
-                {
-                    Pawn.InvManager.SetCurrentWeapon(RangeMedicGun);
-                }
-                // End:0x201
-                break;
-            // End:0x1FE
-            case 1:
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                // End:0x201
-                break;
-            // End:0xFFFF
-            default:
-                break;
-        }
-        //return;        
-=======
         if((PendingHeal == none) || !PendingHeal.IsAliveAndWell())
         {
             PendingHeal = none;
@@ -3442,23 +3200,14 @@ state HealRanged
             default:
                 break;
         }
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     }
 
     function TimeOut()
     {
         PickCombatStyle();
-<<<<<<< HEAD
-        //return;        
     }
 Begin:
 
-    // End:0x2D
-=======
-    }
-Begin:
-
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     if(Pawn.Physics == 2)
     {
         WaitForLanding();
@@ -3466,10 +3215,6 @@ Begin:
     Focus = PendingHeal;
     FinishRotation();
     Timer();
-<<<<<<< HEAD
-    SetTimer(0.1000000, true);
-=======
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
     stop;                
 }
 
@@ -3947,4 +3692,4 @@ defaultproperties
     SquadID=255
     bIsPlayer=true
     bNotifyApex=true
-}
+}

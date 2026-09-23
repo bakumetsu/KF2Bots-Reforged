@@ -46,14 +46,11 @@ var config string _Separator6;
 var() config bool bDebugGrapple;
 var() config int MaxZedsForFailsafe;
 var() config float FailsafeActivationDelay;
-<<<<<<< HEAD
-=======
 var config string _Separator7;
 var() config float HealCylinderRadius;
 var() config float HealCylinderHeight;
 var() config float HealMinHealthPct;
 var() config bool bEnableFastTraceHealing;
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
 var transient array<string> AvailableBotNames;
 var transient array< Class<KFPerk> > PerkPool;
 var transient array<int> PerkPoolCounts;
@@ -128,17 +125,12 @@ function PostBeginPlay()
         _Separator4 = "--- CHEATS ---";
         _Separator5 = "--- BOT NAMING & PERK RESTRICTIONS ---";
         _Separator6 = "--- GRAPPLE ESCAPE SETTINGS ---";
-
-<<<<<<< HEAD
-=======
         // Healing system overhaul
         HealCylinderRadius = 400.0;
         HealCylinderHeight = 300.0;
         HealMinHealthPct = 60.0;
         bEnableFastTraceHealing = true;
         _Separator7 = "--- HEALING SETTINGS ---";
-
->>>>>>> e6078b5 (Healing Behavior added, but only player vs npc worked)
         ConfigVer = CUR_CONFIGVER;
         SaveConfig();
     }
