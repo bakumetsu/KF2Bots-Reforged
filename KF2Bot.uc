@@ -21,6 +21,7 @@ var int CurrentLevel;
 var Class<KFPerk> Perk;
 var Class<KFWeapon> FavoriteWeapon;
 var KF2BotsMut mut;
+var KFCharacterInfo_Human CharacterArch;
 var KFPawn_Human KPawn;
 var KFPawn_Human PendingHeal;
 var Pawn FollowingHuman;

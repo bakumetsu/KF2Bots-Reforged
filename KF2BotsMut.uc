@@ -459,70 +459,90 @@ final function string PickCustomBotName()
     return PickedName;
 }
 
+// Randomly picks a fully-voiced character from the master roster
+// (KFPlayerReplicationInfo.CharacterArchetypes) and stores it on the bot so
+// RestartBot() can apply it via KFPawn.SetCharacterArch() once the pawn
+// exists. Every playable character ships with a SoundGroupArch (its voice);
+// any entry missing one is skipped. Falls back to index 0 (Mr. Foster) if the
+// roster is empty or every entry fails the voice check.
 final function InitBotCharacter(KF2Bot Bot)
 {
-    local byte I, J, Z, C, lvl;
-
-    local KFCharacterInfo_Human H;
+    local byte I, C, lvl;
     local KF2Bot B;
-    local KFPlayerReplicationInfo PRI, PRIB;
+    local KFPlayerReplicationInfo PRI;
+    local KFCharacterInfo_Human H;
     local string BotName;
 
     lvl = byte(BotMinPerkLv + Rand((BotMaxPerkLv - BotMinPerkLv) + 1));
     Bot.CurrentLevel = lvl;
     PRI = KFPlayerReplicationInfo(Bot.PlayerReplicationInfo);
-    while(true)
+
+    if((PRI == none) || (PRI.CharacterArchetypes.Length == 0))
+    {
+        Bot.CharacterArch = none;
+    }
+    else
     {
         I = byte(Rand(PRI.CharacterArchetypes.Length));
         H = PRI.CharacterArchetypes[I];
-        J = byte(Rand(H.BodyVariants.Length));
-        Z = byte(Rand(H.BodyVariants[J].SkinVariations.Length));
-        if(++C < 4)
+        
+        C = 0;
+        while((H == none || H.SoundGroupArch == none) && C < PRI.CharacterArchetypes.Length)
         {
-            foreach WorldInfo.AllControllers(Class'KF2Bots.KF2Bot', B)
+            I = byte((I + 1) % PRI.CharacterArchetypes.Length);
+            H = PRI.CharacterArchetypes[I];
+            C++;
+        }
+        
+        if(H == none || H.SoundGroupArch == none)
+        {
+            I = 0;
+            H = PRI.CharacterArchetypes[0];
+        }
+        
+        if(PRI.CharacterArchetypes.Length > 1)
+        {
+            C = 0;
+            while(C < 4)
             {
-                PRIB = KFPlayerReplicationInfo(B.PlayerReplicationInfo);
-                if((PRIB != none) && PRIB != PRI)
+                B = none;
+                foreach WorldInfo.AllControllers(class'KF2Bot', B)
                 {
-                    if(((PRIB.RepCustomizationInfo.CharacterIndex == I) && PRIB.RepCustomizationInfo.BodyMeshIndex == J) && PRIB.RepCustomizationInfo.BodySkinIndex == Z)
+                    if((B != none) && (B != Bot) && (B.CharacterArch == H))
                     {
                         break;
                     }
+                    B = none;
                 }
-                PRIB = none;
-            }
-            if(PRIB != none)
-            {
-                continue;
+                if(B == none)
+                {
+                    break;
+                }
+                I = byte((I + 1) % PRI.CharacterArchetypes.Length);
+                H = PRI.CharacterArchetypes[I];
+                C++;
             }
         }
-        // DISABLED: the compiler rejects every write to PRI.RepCustomizationInfo
-        // ("Can't assign Const variables"). Reading it (see the duplicate check
-        // above) is still fine. Bots simply keep the default appearance the engine
-        // gives them. The writes are commented out together because the compiler
-        // stops at the first one and would flag the rest on the next build.
-        //PRI.RepCustomizationInfo.CharacterIndex = I;
-        //C = byte(Rand(H.HeadVariants.Length));
-        //PRI.RepCustomizationInfo.HeadMeshIndex = C;
-        //PRI.RepCustomizationInfo.HeadSkinIndex = Rand(H.HeadVariants[C].SkinVariations.Length);
-        //PRI.RepCustomizationInfo.BodyMeshIndex = J;
-        //PRI.RepCustomizationInfo.BodySkinIndex = Z;
-        //if(Rand(3) != 0)
-        //{
-        //    C = byte(Rand(H.CosmeticVariants.Length));
-        //    PRI.RepCustomizationInfo.AttachmentMeshIndices[0] = C;
-        //    PRI.RepCustomizationInfo.AttachmentSkinIndices[0] = Rand(H.CosmeticVariants[C].SkinVariations.Length);
-        //}
-        BotName = PickCustomBotName();
-        if(BotName == "")
-        {
-            BotName = Localize((string(H.Name) $ ".BodyMesh") $ string(J), "BodySkin" $ string(Z), "KFCharacterInfo");
-        }
-        PRI.SetPlayerName((("[Lv" $ string(lvl)) $ "] ") $ BotName);
-        break;
+        Bot.CharacterArch = H;
     }
 
-    //return;    
+    BotName = PickCustomBotName();
+    if(BotName == "")
+    {
+        if(Bot.CharacterArch != none)
+        {
+            BotName = string(Bot.CharacterArch.Name);
+        }
+        else
+        {
+            BotName = "Horzine_Bot";
+        }
+    }
+    
+    if(PRI != none)
+    {
+        PRI.SetPlayerName(BotName);
+    }
 }
 
 // Original selection logic (any registered perk, retried until it isn't
@@ -791,6 +811,17 @@ final function RestartBot(KF2Bot NewPlayer, optional NavigationPoint StartSpot)
             }
         }
         KF.SetTeam(NewPlayer, KF.Teams[0]);
+        // Apply the character arch chosen in InitBotCharacter() so the bot
+        // gets its own mesh and voice instead of the engine default
+        // (Mr. Foster). This MUST run after SetTeam above: SetTeam fires
+        // NotifyTeamChanged(), which calls SetCharacterArch(GetCharacterInfo())
+        // and would otherwise snap the bot back to Mr. Foster (index 0).
+        // SetCharacterArch also wires up SoundGroupArch and VoiceGroupArch,
+        // which is what gives each character its voice.
+        if((KFPawn(NewPlayer.Pawn) != none) && (NewPlayer.CharacterArch != none))
+        {
+            KFPawn(NewPlayer.Pawn).SetCharacterArch(NewPlayer.CharacterArch, true);
+        }
         // End:0x92B
         if(KFPlayerReplicationInfo(NewPlayer.PlayerReplicationInfo) != none)
         {
