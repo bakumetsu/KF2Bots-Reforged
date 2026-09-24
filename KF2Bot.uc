@@ -2968,122 +2968,25 @@ Begin:
 
 state HealOther
 {
+    ignores FinishedMove;
+
     event BeginState(name PreviousStateName)
     {
         AbortMove();
-        HealingStage = 0;
-        bHealFired = false;
-        LastHealFireTime = 0.0000000;
-        SetTimer(0.1000000, true);
-        SetTimer(2.0000000, false, 'TimeOut');
     }
 
     event EndState(name NextStateName)
     {
-        SetTimer(0.0000000, false);
         ClearTimer('TimeOut');
-        bHealFired = false;
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
     }
 
-    function Timer()
-    {
-        local float Pct, DHoriz, DVert;
-
-        if(mut == none)
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if((PendingHeal == none) || !PendingHeal.IsAliveAndWell())
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if(!TargetLowHealth(PendingHeal))
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        Pct = (float(PendingHeal.Health) / float(PendingHeal.HealthMax)) * 100.0000000;
-        if(Pct > mut.HealMinHealthPct)
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-
-        DHoriz = VSize(PendingHeal.Location - Pawn.Location);
-        DVert = Abs(PendingHeal.Location.Z - Pawn.Location.Z);
-        if((DHoriz > mut.HealCylinderRadius) || (DVert > mut.HealCylinderHeight))
-        {
-            return;
-        }
-        if(!ActorReachable(PendingHeal))
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if(mut.bEnableFastTraceHealing && !FastTrace(Pawn.Location, PendingHeal.Location))
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-
-        switch(HealingStage)
-        {
-            case 0:
-                if((MedicGun == none) || !MedicGun.HasAmmo(0))
-                {
-                    PendingHeal = none;
-                    PickCombatStyle();
-                    return;
-                }
-                if(Pawn.Weapon != MedicGun)
-                {
-                    Pawn.InvManager.SetCurrentWeapon(MedicGun);
-                    return;
-                }
-                Focus = PendingHeal;
-                Target = PendingHeal;
-                Pawn.StopFiring();
-                if(MedicGun.IsInState('WeaponEquipping') || bHealFired)
-                {
-                    return;
-                }
-                MedicGun.StartFire(0);
-                bHealFired = true;
-                LastHealFireTime = WorldInfo.TimeSeconds;
-                ++HealingStage;
-                break;
-            case 1:
-                if(WorldInfo.TimeSeconds - LastHealFireTime < 0.5000000)
-                {
-                    return;
-                }
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                break;
-            default:
-                break;
-        }
-    }
-
-    function FinishedMove()
-    {
-        MoveTowardX(PendingHeal);
-    }
-
     function TimeOut()
     {
+        PendingHeal = none;
         PickCombatStyle();
     }
 Begin:
@@ -3092,8 +2995,64 @@ Begin:
     {
         WaitForLanding();
     }
-    FinishedMove();
-    stop;                    
+    SetTimer(5.0000000, false, 'TimeOut');
+
+    while((MedicGun != none) && Pawn.Weapon != MedicGun)
+    {
+        Pawn.InvManager.SetCurrentWeapon(MedicGun);
+        Sleep(0.1000000);
+    }
+    if(MedicGun == none)
+    {
+        ClearTimer('TimeOut');
+        PendingHeal = none;
+        PickCombatStyle();
+        stop;
+    }
+
+    while(true)
+    {
+        if((PendingHeal == none) || !PendingHeal.IsAliveAndWell() || PendingHeal.Health >= PendingHeal.HealthMax)
+        {
+            ClearTimer('TimeOut');
+            PendingHeal = none;
+            PickCombatStyle();
+            stop;
+        }
+        if((VSize(PendingHeal.Location - Pawn.Location) <= 200.0000000) && LineOfSightTo(PendingHeal))
+        {
+            break;
+        }
+        MoveTowardX(PendingHeal);
+        Sleep(0.1000000);
+    }
+    ClearTimer('TimeOut');
+
+    AbortMove();
+    Pawn.Acceleration = vect(0.0000000, 0.0000000, 0.0000000);
+    Focus = PendingHeal;
+    Target = PendingHeal;
+    FinishRotation();
+
+    if(MedicGun.AmmoCount[0] >= 100)
+    {
+        MedicGun.AmmoCount[0] -= 100;
+        MedicGun.PerformReload();
+        MedicGun.PlayAnimation('Heal_Team');
+        PendingHeal.HealthToRegen += 20;
+        Sleep(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Team'), 0.1000000));
+
+        if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
+        {
+            PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
+        }
+        PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
+        PendingHeal.PlayHeal(class'KFDT_Healing');
+    }
+
+    PendingHeal = none;
+    PickCombatStyle();
+    stop;
 }
 
 state HealRanged
@@ -3103,107 +3062,20 @@ state HealRanged
     event BeginState(name PreviousStateName)
     {
         AbortMove();
-        HealingStage = 0;
-        bHealFired = false;
-        LastHealFireTime = 0.0000000;
-        SetTimer(0.1000000, true);
-        SetTimer(2.0000000, false, 'TimeOut');
     }
 
     event EndState(name NextStateName)
     {
-        SetTimer(0.0000000, false);
         ClearTimer('TimeOut');
-        bHealFired = false;
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
     }
 
-    function Timer()
-    {
-        local float Pct;
-
-        if(mut == none)
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if((PendingHeal == none) || !PendingHeal.IsAliveAndWell())
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if(!TargetLowHealth(PendingHeal))
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        Pct = (float(PendingHeal.Health) / float(PendingHeal.HealthMax)) * 100.0000000;
-        if(Pct > mut.HealMinHealthPct)
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if(mut.bEnableFastTraceHealing && !FastTrace(Pawn.Location, PendingHeal.Location))
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-        if(VSize(PendingHeal.Location - Pawn.Location) > 1800.0000000)
-        {
-            PendingHeal = none;
-            PickCombatStyle();
-            return;
-        }
-
-        switch(HealingStage)
-        {
-            case 0:
-                if((RangeMedicGun == none) || !RangeMedicGun.HasAmmo(1))
-                {
-                    PendingHeal = none;
-                    PickCombatStyle();
-                    return;
-                }
-                if(Pawn.Weapon != RangeMedicGun)
-                {
-                    Pawn.InvManager.SetCurrentWeapon(RangeMedicGun);
-                    return;
-                }
-                Focus = PendingHeal;
-                Target = PendingHeal;
-                Pawn.StopFiring();
-                if(RangeMedicGun.IsInState('WeaponEquipping') || bHealFired)
-                {
-                    return;
-                }
-                RangeMedicGun.StartFire(1);
-                bHealFired = true;
-                LastHealFireTime = WorldInfo.TimeSeconds;
-                ++HealingStage;
-                break;
-            case 1:
-                if(WorldInfo.TimeSeconds - LastHealFireTime < 0.5000000)
-                {
-                    return;
-                }
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                break;
-            default:
-                break;
-        }
-    }
-
     function TimeOut()
     {
+        PendingHeal = none;
         PickCombatStyle();
     }
 Begin:
@@ -3212,12 +3084,65 @@ Begin:
     {
         WaitForLanding();
     }
-    Focus = PendingHeal;
-    FinishRotation();
-    Timer();
-    stop;                
-}
+    SetTimer(5.0000000, false, 'TimeOut');
 
+    while((RangeMedicGun != none) && Pawn.Weapon != RangeMedicGun)
+    {
+        Pawn.InvManager.SetCurrentWeapon(RangeMedicGun);
+        Sleep(0.1000000);
+    }
+    if(RangeMedicGun == none)
+    {
+        ClearTimer('TimeOut');
+        PendingHeal = none;
+        PickCombatStyle();
+        stop;
+    }
+
+    while(true)
+    {
+        if((PendingHeal == none) || !PendingHeal.IsAliveAndWell() || PendingHeal.Health >= PendingHeal.HealthMax)
+        {
+            ClearTimer('TimeOut');
+            PendingHeal = none;
+            PickCombatStyle();
+            stop;
+        }
+        if((VSize(PendingHeal.Location - Pawn.Location) <= 1500.0000000) && LineOfSightTo(PendingHeal))
+        {
+            break;
+        }
+        MoveTowardX(PendingHeal);
+        Sleep(0.1000000);
+    }
+    ClearTimer('TimeOut');
+
+    AbortMove();
+    Pawn.Acceleration = vect(0.0000000, 0.0000000, 0.0000000);
+    Focus = PendingHeal;
+    Target = PendingHeal;
+    FinishRotation();
+
+    if(RangeMedicGun.AmmoCount[1] >= 50)
+    {
+        RangeMedicGun.AmmoCount[1] -= 50;
+        RangeMedicGun.StartHealRecharge();
+        RangeMedicGun.PlayAnimation('Shoot_Dart');
+        PendingHeal.HealthToRegen += RangeMedicGun.default.HealAmount;
+        Sleep(RangeMedicGun.GetFireInterval(1));
+
+        if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
+        {
+            PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
+        }
+        PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
+        PendingHeal.PlayHeal(class'KFDT_Healing');
+    }
+
+    PendingHeal = none;
+    PickCombatStyle();
+    stop;
+}
 state GrenadeTarget
 {
     event BeginState(name PreviousStateName)
