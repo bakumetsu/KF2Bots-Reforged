@@ -97,17 +97,39 @@ simulated function Destroyed()
 
 function InitPlayerReplicationInfo()
 {
+    local KFGameInfo KFGI;
+    local KFPlayerReplicationInfo KFPRI;
+
     super(Controller).InitPlayerReplicationInfo();
-    // End:0x39
+    
     if(PlayerReplicationInfo != none)
     {
         PlayerReplicationInfo.bBot = false;
+        PlayerReplicationInfo.bOnlySpectator = false;
+        PlayerReplicationInfo.PlayerName = "Horzine_Bot_" $ Rand(9999);
+        
+        KFPRI = KFPlayerReplicationInfo(PlayerReplicationInfo);
+        if(KFPRI != none)
+        {
+            KFPRI.bHasSpawnedIn = true;
+        }
+
+        KFGI = KFGameInfo(WorldInfo.Game);
+        if((KFGI != none) && KFGI.Teams[0] != none)
+        {
+            KFGI.SetTeam(self, KFGI.Teams[0]);
+        }
+
+        if(WorldInfo.GRI != none)
+        {
+            WorldInfo.GRI.AddPRI(PlayerReplicationInfo);
+        }
     }
+    
     if(mut != none)
     {
         mut.InitBotCharacter(self);
     }
-    //return;    
 }
 
 final function GiveWeaponDef(Class<KFWeaponDefinition> W)
@@ -2876,85 +2898,25 @@ Begin:
 
 state HealingSelf
 {
+    ignores FinishedMove;
+
     event BeginState(name PreviousStateName)
     {
         AbortMove();
-        HealingStage = 0;
-        bHealFired = false;
-        LastHealFireTime = 0.0000000;
-        SetTimer(0.1000000, true);
     }
 
     event EndState(name NextStateName)
     {
-        SetTimer(0.0000000, false);
-        bHealFired = false;
+        ClearTimer('TimeOut');
         if(Pawn != none)
         {
             Pawn.StopFiring();
         }
     }
 
-    function Timer()
+    function TimeOut()
     {
-        local float Pct;
-
-        if(mut == none)
-        {
-            PickCombatStyle();
-            return;
-        }
-        if(((KPawn == none) || KPawn.Health <= 0) || !KPawn.IsAliveAndWell())
-        {
-            PickCombatStyle();
-            return;
-        }
-        Pct = (float(KPawn.Health) / float(KPawn.HealthMax)) * 100.0000000;
-        if(Pct > mut.HealMinHealthPct)
-        {
-            PickCombatStyle();
-            return;
-        }
-        switch(HealingStage)
-        {
-            case 0:
-                if((MedicGun == none) || !MedicGun.HasAmmo(1))
-                {
-                    PickCombatStyle();
-                    return;
-                }
-                if(Pawn.Weapon != MedicGun)
-                {
-                    Pawn.InvManager.SetCurrentWeapon(MedicGun);
-                    return;
-                }
-                Focus = Pawn;
-                Pawn.StopFiring();
-                if(MedicGun.IsInState('WeaponEquipping') || bHealFired)
-                {
-                    return;
-                }
-                MedicGun.StartFire(1);
-                bHealFired = true;
-                LastHealFireTime = WorldInfo.TimeSeconds;
-                ++HealingStage;
-                break;
-            case 1:
-                if(WorldInfo.TimeSeconds - LastHealFireTime < 0.5000000)
-                {
-                    return;
-                }
-                KFInvManager.SwitchToLastWeapon();
-                PickCombatStyle();
-                break;
-            default:
-                break;
-        }
-    }
-
-    function FinishedMove()
-    {
-        PickRetreatMove();
+        PickCombatStyle();
     }
 Begin:
 
@@ -2962,10 +2924,59 @@ Begin:
     {
         WaitForLanding();
     }
-    FinishedMove();
-    stop;                    
-}
+    SetTimer(5.0000000, false, 'TimeOut');
 
+    if((KPawn == none) || KPawn.Health <= 0)
+    {
+        ClearTimer('TimeOut');
+        PickCombatStyle();
+        stop;
+    }
+
+    // Step 1: equip the syringe
+    while((MedicGun != none) && Pawn.Weapon != MedicGun)
+    {
+        Pawn.InvManager.SetCurrentWeapon(MedicGun);
+        Sleep(0.1000000);
+    }
+    if(MedicGun == none)
+    {
+        ClearTimer('TimeOut');
+        PickCombatStyle();
+        stop;
+    }
+    if(KPawn.Health <= 0)
+    {
+        ClearTimer('TimeOut');
+        PickCombatStyle();
+        stop;
+    }
+    ClearTimer('TimeOut');
+
+    Focus = Pawn;
+
+    // Step 2: apply self-heal
+    if(MedicGun.AmmoCount[0] >= 100)
+    {
+        MedicGun.AmmoCount[0] -= 100;
+        MedicGun.PerformReload();
+        MedicGun.PlayAnimation('Heal_Self');
+        KPawn.HealthToRegen += 20;
+        Sleep(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Self'), 0.1000000));
+
+        // Step 3: native triggers, on KPawn (not PendingHeal)
+        if(KPawn.Health + KPawn.HealthToRegen > KPawn.HealthMax)
+        {
+            KPawn.HealthToRegen = KPawn.HealthMax - KPawn.Health;
+        }
+        KPawn.SetTimer(KPawn.HealthRegenRate, true, 'GiveHealthOverTime');
+        KPawn.PlayHeal(class'KFDT_Healing');
+    }
+
+    // Step 4
+    PickCombatStyle();
+    stop;
+}
 state HealOther
 {
     ignores FinishedMove;
@@ -3496,7 +3507,33 @@ MoneyToss:
 state Dead
 {
     ignores StopAdjusting, Tick, CheckGrabbed, PickCombatStyle, SetEnemy, KilledBy, 
-	    HearNoise, SeeMonster, SeePlayer;
+            HearNoise, SeeMonster, SeePlayer;
+
+    event BeginState(name PreviousStateName)
+    {
+        SetTimer(1.0000000, true, 'ReassertScoreboardFlags');
+    }
+
+    event EndState(name NextStateName)
+    {
+        ClearTimer('ReassertScoreboardFlags');
+    }
+
+    function ReassertScoreboardFlags()
+    {
+        local KFPlayerReplicationInfo KFPRI;
+        
+        if(PlayerReplicationInfo != none)
+        {
+            KFPRI = KFPlayerReplicationInfo(PlayerReplicationInfo);
+            if(KFPRI != none)
+            {
+                KFPRI.bHasSpawnedIn = true;
+            }
+        }
+    }
+
+Begin:
     stop;    
 }
 
