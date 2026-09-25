@@ -10,13 +10,35 @@ struct FRouteDoorBlockade
 var array<FRouteDoorBlockade> DoorPaths;
 var array<NavigationPoint> BotBlockRoutes;
 var byte PlayStyle;
-var byte SquadID;
+var Actor AssignedAnchor;
+var int   GroupID;
+var bool  bIsGroupLeader;
+var bool  bIsAlphaCommander;
+
+var bool  bSingleFileFormation;
+var float LastCQBCheckTime;
+
+var bool    bIsStuck;
+var bool    bAttemptingUnweld;
+var bool    bHasStuckBaseline;
+var vector  LeaderLocation3SecAgo;
+var float   LastStuckSampleTime;
+var float   LastRouteDist;
+
+const CQB_TRACE_RADIUS_SQ  = 90000.0;
+const CQB_TRACE_INTERVAL   = 1.0;
+const CQB_PROBE_DIST       = 150.0;
+const STUCK_SAMPLE_INTERVAL = 3.0;
+const STUCK_DIST_SQ         = 10000.0;
+const DOOR_CHECK_RADIUS     = 200.0;
+const SINGLE_FILE_SPACING = 130.0;
+const PERIMETER_RADIUS    = 220.0;
+const DEG_TO_RAD          = 0.0174532925;
 var transient byte CallStack;
 var byte MoveFlags;
 var byte HealingStage;
 var byte FailedMoveCount;
 var byte DoshDropCounter;
-var KF2Bot BotLeader;
 var int CurrentLevel;
 var Class<KFPerk> Perk;
 var Class<KFWeapon> FavoriteWeapon;
@@ -85,6 +107,7 @@ simulated function PreBeginPlay()
     ++WorldInfo.Game.NumBots;
     KFGRI = KFGameReplicationInfo(WorldInfo.GRI);
     SetTimer(0.5000000 + (FRand() * 0.5000000), true, 'EyeSightCheck');
+    if (mut != None) mut.RegisterBot(self);
     //return;    
 }
 
@@ -92,7 +115,7 @@ simulated function Destroyed()
 {
     super(Controller).Destroyed();
     --WorldInfo.Game.NumBots;
-    mut.FreeSquadID(self);
+    if (mut != None) mut.UnregisterBot(self);
     //return;    
 }
 
@@ -2058,121 +2081,248 @@ function NotifyKilled(Controller Killer, Controller Killed, Pawn KilledPawn, Cla
 
 state PickNextMove
 {
-    function PickCombatStyle()
+    event BeginState(Name PreviousStateName)
     {
-        local KFWeapon W;
+        `log("KF2BOT: SUCCESS - Entered PickNextMove from " $ PreviousStateName);
+    }
 
-        // End:0x45
-        if((Pawn == none) || !Pawn.IsAliveAndWell())
+    function PickMove()
+    {
+        // Priority 1: Match Ended check (Evaluated natively via VictoryDance state changes)
+        // Priority 2: Grabbed Override (Evaluated via CheckGrabbed / BreakLose state)
+
+        // Priority 3: Critical Survival
+        if (KPawn != none && TargetLowHealth(Pawn) && CheckShouldSelfHeal())
         {
-            GotoState('Dead');
+            GotoState('HealingSelf');
             return;
         }
-        // End:0x123
-        if(KPawn != none)
+
+        // Priority 6: Squad Medic
+        if (KPawn != none)
         {
-            // End:0xAE
-            if(KPawn.IsDoingSpecialMove(31) && KPawn.InteractionPawn != none)
+            if (CheckMedicGunHeal())
             {
-                GotoState('BreakLose');
+                GotoState('HealRanged');
                 return;
             }
-            // End:0xE6
-            if(TargetLowHealth(Pawn) && CheckShouldSelfHeal())
+            if (CheckShouldHealMate())
             {
-                GotoState('HealingSelf');
-                return;                
-            }
-            else
-            {
-                // End:0x106
-                if(CheckMedicGunHeal())
-                {
-                    GotoState('HealRanged');
-                    return;                    
-                }
-                else
-                {
-                    // End:0x123
-                    if(CheckShouldHealMate())
-                    {
-                        GotoState('HealOther');
-                        return;
-                    }
-                }
-            }
-        }
-        SwitchToBestWeapon();
-        // End:0x169
-        if(((KPawn != none) && Rand(4) == 0) && FindCollectable())
-        {
-            GotoState('GetItem');
-            return;
-        }
-        // End:0x340
-        if(((Enemy == none) || !Enemy.IsAliveAndWell()) || (KFPawn_Monster(Enemy) != none) && KFPawn_Monster(Enemy).bIsHeadless)
-        {
-            W = KFWeapon(Pawn.Weapon);
-            // End:0x26B
-            if((W != none) && W.CanReload())
-            {
-                W.StartFire(2);
-            }
-            Enemy = none;
-            // End:0x2FD
-            if((KFGRI.bTraderIsOpen && NextShoppingTime < WorldInfo.TimeSeconds) && KFGRI.OpenedTrader != none)
-            {
-                GotoState('GoShopping');                
-            }
-            else
-            {
-                // End:0x330
-                if(mut.bObjectiveActive)
-                {
-                    GotoState('DoObjective');                    
-                }
-                else
-                {
-                    GotoState('Roaming');
-                }
-            }
-            return;
-        }
-        // End:0x40B
-        if((KPawn != none) && NextGrenadeTimer < WorldInfo.TimeSeconds)
-        {
-            NextGrenadeTimer = (WorldInfo.TimeSeconds + 0.5000000) + (FRand() * 3.0000000);
-            // End:0x40B
-            if(((KFInvManager.GrenadeCount > 0) && Rand(2) == 0) && ShouldNadeEnemies())
-            {
-                GotoState('GrenadeTarget');
+                GotoState('HealOther');
                 return;
             }
         }
-        // End:0x42D
-        if(LineOfSightTo(Enemy))
+
+        // Priority 7: Combat Engagement
+        if (Enemy != none && Enemy.IsAliveAndWell() && !(KFPawn_Monster(Enemy) != none && KFPawn_Monster(Enemy).bIsHeadless))
         {
-            GotoState('FightEnemy');            
+            if (LineOfSightTo(Enemy))
+            {
+                GotoState('FightEnemy');
+                return;
+            }
+            GotoState('Hunting');
+            return;
+        }
+
+        // Priority 9: Economy
+        if (KFGRI.bTraderIsOpen && NextShoppingTime < WorldInfo.TimeSeconds && KFGRI.OpenedTrader != none)
+        {
+            GotoState('GoShopping');
+            return;
+        }
+
+        // Priority 5: SYG Enforcement
+        if (mut.bObjectiveActive)
+        {
+            GotoState('DoObjective');
+            return;
+        }
+
+        // Priority 8: Squad Tethering
+        if (EvaluateSquadTether()) return;
+
+        // Priority 10: Camp
+        ExecuteCampState();
+    }
+
+Begin:
+    Sleep(0.0);
+    PickMove();
+    stop;
+}
+
+function bool EvaluateSquadTether()
+{
+    if (Pawn == None || mut == None) return false;
+    if (!IsAnchorValid(AssignedAnchor)) return false;
+    if (bIsGroupLeader) return EvaluateLeaderMove();
+    return EvaluateFollowerMove();
+}
+
+function bool IsAnchorValid(Actor Anchor)
+{
+    local Pawn AnchorPawn;
+    if (Anchor == None || Anchor.bDeleteMe) return false;
+    AnchorPawn = Pawn(Anchor);
+    if (AnchorPawn != None && AnchorPawn.Health <= 0) return false;
+    return true;
+}
+
+function bool EvaluateLeaderMove()
+{
+    UpdatePillarOfSaltTracking();
+    if (bAttemptingUnweld) return false;
+    UpdateCQBFormation();
+    return MoveTowardGoal(AssignedAnchor, vect(0,0,0), true);
+}
+
+function bool EvaluateFollowerMove()
+{
+    local KF2Bot Leader;
+    local vector FormationGoal;
+
+    Leader = mut.GetGroupLeader(GroupID);
+    if (Leader == None || Leader.bIsStuck || Leader.Pawn == None || Leader.Pawn.Health <= 0)
+    {
+        return MoveTowardGoal(AssignedAnchor, vect(0,0,0), true);
+    }
+
+    FormationGoal = ComputeFormationOffset(Leader, Leader.bSingleFileFormation);
+    return MoveTowardGoal(None, FormationGoal, false);
+}
+
+function bool MoveTowardGoal(Actor GoalActor, vector GoalPoint, bool bActorGoal)
+{
+    local NavigationPoint PathNode;
+    if (bActorGoal && GoalActor != None)
+    {
+        PathNode = NavigationPoint(FindPathToward(GoalActor));
+        LastRouteDist = RouteDist;
+        if (PathNode != None)
+        {
+            MoveTowardX(PathNode);
+            return true;
+        }
+        MoveToX(GoalActor.Location);
+        return true;
+    }
+    MoveToX(GoalPoint);
+    return true;
+}
+
+function UpdateCQBFormation()
+{
+    local vector RightVec, ProbeStart, ProbeEndLeft, ProbeEndRight;
+    local bool bLeftClear, bRightClear;
+
+    if (Pawn == None || AssignedAnchor == None) return;
+    if (WorldInfo.TimeSeconds - LastCQBCheckTime < CQB_TRACE_INTERVAL) return;
+    if (VSizeSq(Pawn.Location - AssignedAnchor.Location) >= CQB_TRACE_RADIUS_SQ) return;
+
+    LastCQBCheckTime = WorldInfo.TimeSeconds;
+
+    RightVec = Normal(vector(Pawn.Rotation) cross vect(0,0,1));
+    ProbeStart = Pawn.Location;
+    ProbeEndLeft  = ProbeStart - (RightVec * CQB_PROBE_DIST);
+    ProbeEndRight = ProbeStart + (RightVec * CQB_PROBE_DIST);
+
+    bLeftClear  = FastTrace(ProbeEndLeft, ProbeStart);
+    bRightClear = FastTrace(ProbeEndRight, ProbeStart);
+
+    bSingleFileFormation = (!bLeftClear || !bRightClear);
+}
+
+function vector ComputeFormationOffset(KF2Bot Leader, bool bSingleFile)
+{
+    local int FollowerIdx, GroupSize;
+    local float Angle;
+    local vector Forward, Right, Offset;
+
+    if (Leader == None || Leader.Pawn == None || Pawn == None)
+        return Pawn.Location;
+
+    FollowerIdx = mut.GetFollowerIndex(self);
+    GroupSize   = mut.GetGroupSize(GroupID);
+    if (GroupSize <= 0) GroupSize = 1;
+
+    Forward = vector(Leader.Pawn.Rotation);
+    Right   = Normal(Forward cross vect(0,0,1));
+
+    if (bSingleFile)
+    {
+        Offset = Leader.Pawn.Location - (Forward * (SINGLE_FILE_SPACING * FollowerIdx));
+    }
+    else
+    {
+        Angle = ((360.0 / GroupSize) * FollowerIdx) + (GroupID * 15.0);
+        Offset = Leader.Pawn.Location
+               + (Forward * PERIMETER_RADIUS * cos(Angle * DEG_TO_RAD))
+               + (Right   * PERIMETER_RADIUS * sin(Angle * DEG_TO_RAD));
+    }
+    return Offset;
+}
+
+function UpdatePillarOfSaltTracking()
+{
+    local KFDoorMarker Marker;
+    local bool bFoundDoor;
+
+    if (Pawn == None) return;
+
+    if (!bHasStuckBaseline)
+    {
+        LeaderLocation3SecAgo = Pawn.Location;
+        LastStuckSampleTime = WorldInfo.TimeSeconds;
+        bHasStuckBaseline = true;
+        return;
+    }
+
+    if (WorldInfo.TimeSeconds - LastStuckSampleTime < STUCK_SAMPLE_INTERVAL) return;
+
+    bIsStuck = (VSizeSq(Pawn.Location - LeaderLocation3SecAgo) < STUCK_DIST_SQ);
+
+    if (bIsStuck)
+    {
+        bFoundDoor = false;
+        foreach Pawn.OverlappingActors(class'KFDoorMarker', Marker, DOOR_CHECK_RADIUS)
+        {
+            bFoundDoor = true;
+            break;
+        }
+
+        if (bFoundDoor)
+        {
+            bAttemptingUnweld = true;
+            bIsStuck = false;
         }
         else
         {
-            // End:0x460
-            if(mut.bObjectiveActive)
-            {
-                GotoState('DoObjective');                
-            }
-            else
-            {
-                GotoState('Hunting');
-            }
+            bAttemptingUnweld = false;
+            mut.RequestLeaderDemotion(self);
         }
-        //return;        
     }
-Begin:
+    else
+    {
+        bAttemptingUnweld = false;
+    }
 
-    Sleep(0.0000000);
-    PickCombatStyle();
-    stop;        
+    LeaderLocation3SecAgo = Pawn.Location;
+    LastStuckSampleTime = WorldInfo.TimeSeconds;
+}
+
+function bool ExecuteCampState()
+{
+    // Phase 2: implement camp/hide behavior
+    // Phase 1 fallback: route to Roaming (existing idle state)
+    GotoState('Roaming');
+    return true;
+}
+
+function ResetStuckState()
+{
+    bHasStuckBaseline = false;
+    bIsStuck          = false;
 }
 
 state Roaming
@@ -2183,7 +2333,7 @@ state Roaming
         // End:0x44
         if(KPawn != none)
         {
-            KPawn.SetSprinting(BotLeader != self);
+            KPawn.SetSprinting(!bIsGroupLeader);
         }
         //return;        
     }
@@ -2200,28 +2350,25 @@ state Roaming
 
     function PickStyle()
     {
+        local KF2Bot GroupLeader;
         // End:0x224
         if((PlayStyle == 0) && KPawn != none)
         {
-            // End:0x54
-            if(BotLeader == none)
-            {
-                mut.SetSquadLeader(self);
-            }
+            GroupLeader = (mut != None) ? mut.GetGroupLeader(GroupID) : None;
             // End:0x221
-            if((BotLeader != self) && BotLeader.Pawn != none)
+            if((!bIsGroupLeader) && GroupLeader != none && GroupLeader.Pawn != none)
             {
                 // End:0x18C
-                if(VSizeSq(BotLeader.Pawn.Location - Pawn.Location) > 360000.0000000)
+                if(VSizeSq(GroupLeader.Pawn.Location - Pawn.Location) > 360000.0000000)
                 {
                     // End:0x147
-                    if(ActorReachable(BotLeader.Pawn))
+                    if(ActorReachable(GroupLeader.Pawn))
                     {
-                        MoveToX(GetPointNear(BotLeader.Pawn, 600.0000000));
+                        MoveToX(GetPointNear(GroupLeader.Pawn, 600.0000000));
                         return;
                     }
                     // End:0x189
-                    if(BuildPathToward(BotLeader.Pawn))
+                    if(BuildPathToward(GroupLeader.Pawn))
                     {
                         MoveTowardX(MoveTarget);
                         return;
@@ -2232,13 +2379,12 @@ state Roaming
                     // End:0x1D2
                     if(Rand(3) == 0)
                     {
-                        MoveToX(GetPointNear(BotLeader.Pawn, 600.0000000));                        
+                        MoveToX(GetPointNear(GroupLeader.Pawn, 600.0000000));                        
                     }
                     else
                     {
                         Focus = none;
                         SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
-                        GotoState('Camp');
                     }
                     return;
                 }
@@ -2283,7 +2429,6 @@ state Roaming
                         {
                             Focus = none;
                             SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
-                            GotoState('Camp');
                         }
                         return;
                     }
@@ -2391,7 +2536,6 @@ state DoObjective extends Roaming
         {
             Focus = none;
             SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
-            GotoState('Camp');
             return;
         }
         // End:0x17F
@@ -2491,6 +2635,7 @@ state FightEnemy
     function PickStyle()
     {
         local bool bMelee;
+        local KF2Bot GroupLeader;
 
         // End:0xF8
         if(mut.bObjectiveActive)
@@ -2518,10 +2663,11 @@ state FightEnemy
             }
         }
         // End:0x213
-        if((((((PlayStyle == 0) && KPawn != none) && BotLeader != none) && BotLeader != self) && BotLeader.Pawn != none) && VSizeSq(BotLeader.Pawn.Location - Pawn.Location) > 2250000.0000000)
+        GroupLeader = (mut != None) ? mut.GetGroupLeader(GroupID) : None;
+        if((!bIsGroupLeader) && GroupLeader != none && GroupLeader.Pawn != none && VSizeSq(GroupLeader.Pawn.Location - Pawn.Location) > 2250000.0000000)
         {
             // End:0x210
-            if(BuildPathToward(BotLeader.Pawn))
+            if(BuildPathToward(GroupLeader.Pawn))
             {
                 MoveTowardX(MoveTarget, Enemy);
                 return;
@@ -2833,8 +2979,10 @@ state Hunting
 
     function PickStyle()
     {
+        local KF2Bot GroupLeader;
         // End:0xDC
-        if((((((PlayStyle == 0) && KPawn != none) && BotLeader != none) && BotLeader != self) && BotLeader.Pawn != none) && VSizeSq(BotLeader.Pawn.Location - Pawn.Location) > 810000.0000000)
+        GroupLeader = (mut != None) ? mut.GetGroupLeader(GroupID) : None;
+        if((!bIsGroupLeader) && GroupLeader != none && GroupLeader.Pawn != none && VSizeSq(GroupLeader.Pawn.Location - Pawn.Location) > 810000.0000000)
         {
             Enemy = none;            
         }
@@ -3652,7 +3800,6 @@ Begin:
 
 defaultproperties
 {
-    SquadID=255
     bIsPlayer=true
     bNotifyApex=true
 }

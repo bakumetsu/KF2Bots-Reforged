@@ -4,6 +4,13 @@ class KF2BotsMut extends KFMutator
 
 const CUR_CONFIGVER = 3;
 
+struct FireteamData
+{
+    var array<KF2Bot>   Members;
+    var KF2Bot          Leader;
+    var NavigationPoint Anchor;
+};
+
 var transient array<AIWeaponInfo> TraderList;
 var config int ConfigVer;
 var config string _Separator1;
@@ -17,8 +24,26 @@ var config string _Separator3;
 var() config float BotsDamageScale;
 var() config float ZedCountScaling;
 var KF2BotChat ActiveChat;
-var array<byte> SquadSize;
-var array<KF2Bot> SquadLeader;
+var array<KF2Bot>       ActiveBots;
+var array<FireteamData> Fireteams;
+var int                 NumGroups;
+
+var Controller VIPController;
+var Controller AlphaCommander;
+var Pawn CachedBossPawn;
+var int LastPolledWaveNum;
+
+const MIN_GROUPS                = 2;
+const MAX_GROUPS                = 4;
+const BOTS_PER_GROUP_TARGET     = 3;
+const VIP_ESCORT_MIN_SIZE       = 2;
+const GROUP_DISSOLVE_SIZE       = 1;
+const VANGUARD_OFFSET           = 2000.0;
+const REARGUARD_OFFSET          = 2000.0;
+const CHOKEPOINT_LATERAL_OFFSET = 1000.0;
+const NAV_SEARCH_RADIUS         = 1500.0;
+const MACRO_WAYPOINT_INTERVAL   = 3.0;
+const WAVE_POLL_INTERVAL        = 1.0;
 var KFGameInfo_Survival KF;
 var Actor PrevObjective;
 var array<NavigationPoint> ValidPoints;
@@ -146,6 +171,7 @@ function PostBeginPlay()
         bChatterInit = true;
         ActiveChat = Spawn(Class'KF2Bots.KF2BotChat');
     }
+    SetTimer(WAVE_POLL_INTERVAL, true, 'PollWaveStart');
     //return;    
 }
 
@@ -212,74 +238,595 @@ function Timer()
     //return;    
 }
 
-final function SetSquadID(KF2Bot B)
+function RegisterBot(KF2Bot NewBot)
 {
-    local byte I;
+    if (NewBot == None) return;
+    if (ActiveBots.Find(NewBot) == INDEX_NONE) ActiveBots.AddItem(NewBot);
+    NewBot.mut = self;
+}
 
-    // End:0x69
-    if(KF.NumPlayers > KF.NumBots)
+function UnregisterBot(KF2Bot LeavingBot)
+{
+    local int Idx;
+    if (LeavingBot == None) return;
+    Idx = ActiveBots.Find(LeavingBot);
+    if (Idx != INDEX_NONE) ActiveBots.Remove(Idx, 1);
+    HandleFireteamCasualty(LeavingBot);
+}
+
+function PollWaveStart()
+{
+    local KFGameReplicationInfo KFGRI;
+    KFGRI = KFGameReplicationInfo(WorldInfo.GRI);
+    if (KFGRI == None || !KFGRI.bMatchHasBegun) return;
+
+    if (KFGRI.WaveNum != LastPolledWaveNum)
     {
-        B.PlayStyle = byte(Rand(2));        
+        LastPolledWaveNum = KFGRI.WaveNum;
+        InitializePlatoon();
     }
-    else
+}
+
+function InitializePlatoon()
+{
+    local int i, GroupCount, GroupIdx;
+    local KF2Bot Bot;
+
+    PruneInvalidBots();
+    ShuffleActiveBots();
+
+    if (ActiveBots.Length == 0) return;
+
+    GroupCount = DetermineGroupCount(ActiveBots.Length);
+    NumGroups  = GroupCount;
+
+    Fireteams.Length = 0;
+    Fireteams.Length = GroupCount;
+
+    for (i = 0; i < ActiveBots.Length; i++)
     {
-        // End:0x98
-        if(Rand(2) == 0)
+        Bot = ActiveBots[i];
+        if (Bot == None) continue;
+
+        GroupIdx = i % GroupCount;
+        Bot.GroupID        = GroupIdx + 1;
+        Bot.bIsGroupLeader = false;
+        Fireteams[GroupIdx].Members.AddItem(Bot);
+    }
+
+    for (GroupIdx = 0; GroupIdx < GroupCount; GroupIdx++)
+    {
+        if (Fireteams[GroupIdx].Members.Length > 0)
         {
-            B.PlayStyle = byte(Rand(3));
+            Fireteams[GroupIdx].Leader = Fireteams[GroupIdx].Members[0];
+            Fireteams[GroupIdx].Leader.bIsGroupLeader = true;
         }
     }
-    // End:0xC3
-    if(B.PlayStyle != 0)
+
+    UpdateMacroWaypoints();
+    if (!IsTimerActive('UpdateMacroWaypoints'))
+        SetTimer(MACRO_WAYPOINT_INTERVAL, true, 'UpdateMacroWaypoints');
+}
+
+function ShuffleActiveBots()
+{
+    local int i, SwapIdx;
+    local KF2Bot Temp;
+    for (i = ActiveBots.Length - 1; i > 0; i--)
     {
+        SwapIdx = Rand(i + 1);
+        Temp = ActiveBots[i];
+        ActiveBots[i] = ActiveBots[SwapIdx];
+        ActiveBots[SwapIdx] = Temp;
+    }
+}
+
+function PruneInvalidBots()
+{
+    local int i;
+    for (i = ActiveBots.Length - 1; i >= 0; i--)
+    {
+        if (ActiveBots[i] == None || ActiveBots[i].bDeleteMe
+            || ActiveBots[i].Pawn == None || ActiveBots[i].Pawn.Health <= 0)
+        {
+            ActiveBots.Remove(i, 1);
+        }
+    }
+}
+
+function int DetermineGroupCount(int BotCount)
+{
+    local int Count;
+    Count = BotCount / BOTS_PER_GROUP_TARGET;
+    if (Count < MIN_GROUPS) Count = MIN_GROUPS;
+    if (Count > MAX_GROUPS) Count = MAX_GROUPS;
+    return Count;
+}
+
+function UpdateMacroWaypoints()
+{
+    local int GroupIdx;
+    local KF2Bot GroupLeader;
+    local KFGameReplicationInfo KFGRI;
+    local Pawn BossPawn;
+    local Actor NewAnchor;
+    local vector ProjectedLoc;
+    local Controller VIP;
+
+    PruneInvalidBots();
+
+    if (VIPController != None && (VIPController.Pawn == None || VIPController.Pawn.Health <= 0))
+    {
+        HandleVIPSuccession();
+    }
+
+    if (ActiveBots.Length == 0 || NumGroups <= 0) return;
+
+    KFGRI = KFGameReplicationInfo(WorldInfo.GRI);
+
+    if (KFGRI != None && KFGRI.IsBossWave())
+    {
+        BossPawn = FindBossPawn();
+        if (BossPawn != None)
+        {
+            for (GroupIdx = 0; GroupIdx < NumGroups; GroupIdx++)
+            {
+                GroupLeader = Fireteams[GroupIdx].Leader;
+                if (GroupLeader == None) continue;
+                Fireteams[GroupIdx].Anchor = None;
+                GroupLeader.AssignedAnchor = BossPawn;
+                PropagateAnchorToFollowers(GroupIdx);
+            }
+            return;
+        }
+    }
+
+    VIP = GetVIPController();
+
+    for (GroupIdx = 0; GroupIdx < NumGroups; GroupIdx++)
+    {
+        GroupLeader = Fireteams[GroupIdx].Leader;
+        if (GroupLeader == None) continue;
+
+        switch (GroupIdx)
+        {
+            case 0: 
+                if (VIP != None && VIP.Pawn != None)
+                {
+                    Fireteams[GroupIdx].Anchor = None;
+                    GroupLeader.AssignedAnchor = VIP.Pawn;
+                }
+                break;
+            case 1: 
+                if (VIP != None && VIP.Pawn != None)
+                {
+                    ProjectedLoc = VIP.Pawn.Location + (vector(VIP.Pawn.Rotation) * VANGUARD_OFFSET);
+                    NewAnchor = FindNearestNavPoint(ProjectedLoc, NAV_SEARCH_RADIUS);
+                    if (NewAnchor != None)
+                    {
+                        Fireteams[GroupIdx].Anchor = NavigationPoint(NewAnchor);
+                        GroupLeader.AssignedAnchor = NewAnchor;
+                    }
+                }
+                break;
+            case 2: 
+                if (VIP != None && VIP.Pawn != None)
+                {
+                    ProjectedLoc = VIP.Pawn.Location - (vector(VIP.Pawn.Rotation) * REARGUARD_OFFSET);
+                    NewAnchor = FindNearestNavPoint(ProjectedLoc, NAV_SEARCH_RADIUS);
+                    if (NewAnchor != None)
+                    {
+                        Fireteams[GroupIdx].Anchor = NavigationPoint(NewAnchor);
+                        GroupLeader.AssignedAnchor = NewAnchor;
+                    }
+                }
+                break;
+            case 3: 
+                NewAnchor = FindNearestChokepoint(VIP);
+                if (NewAnchor != None)
+                {
+                    Fireteams[GroupIdx].Anchor = NavigationPoint(NewAnchor);
+                    GroupLeader.AssignedAnchor = NewAnchor;
+                }
+                break;
+        }
+        PropagateAnchorToFollowers(GroupIdx);
+    }
+}
+
+function PropagateAnchorToFollowers(int GroupIdx)
+{
+    local int i;
+    local KF2Bot Member;
+
+    if (Fireteams[GroupIdx].Leader == None) return;
+
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        Member = Fireteams[GroupIdx].Members[i];
+        if (Member != None && !Member.bIsGroupLeader)
+        {
+            Member.AssignedAnchor = Fireteams[GroupIdx].Leader.AssignedAnchor;
+        }
+    }
+}
+
+function NavigationPoint FindNearestNavPoint(vector ProjectedLoc, float SearchRadius)
+{
+    local NavigationPoint FoundNav;
+    foreach WorldInfo.RadiusNavigationPoints(class'NavigationPoint', FoundNav, ProjectedLoc, SearchRadius)
+    {
+        return FoundNav; 
+    }
+    return None;
+}
+
+function NavigationPoint FindNearestChokepoint(Controller VIP)
+{
+    local vector ProjectedLoc, LateralVec;
+    local NavigationPoint FoundNav;
+
+    if (VIP == None || VIP.Pawn == None) return None;
+
+    LateralVec = Normal(vector(VIP.Pawn.Rotation) cross vect(0,0,1));
+    ProjectedLoc = VIP.Pawn.Location + (LateralVec * CHOKEPOINT_LATERAL_OFFSET);
+
+    foreach WorldInfo.RadiusNavigationPoints(class'NavigationPoint', FoundNav, ProjectedLoc, NAV_SEARCH_RADIUS)
+    {
+        return FoundNav;
+    }
+    return None;
+}
+
+function Controller GetVIPController()
+{
+    local Controller C;
+
+    if (VIPController != None && !VIPController.bDeleteMe
+        && VIPController.Pawn != None && VIPController.Pawn.Health > 0)
+    {
+        return VIPController;
+    }
+
+    foreach WorldInfo.AllControllers(class'Controller', C)
+    {
+        if (PlayerController(C) != None && C.Pawn != None && C.Pawn.Health > 0)
+        {
+            VIPController = C;
+            return VIPController;
+        }
+    }
+
+    VIPController = None;
+    return None;
+}
+
+function Pawn FindBossPawn()
+{
+    local Pawn P;
+    local Pawn BestBoss;
+
+    if (CachedBossPawn != None && !CachedBossPawn.bDeleteMe && CachedBossPawn.Health > 0)
+        return CachedBossPawn;
+
+    foreach WorldInfo.AllPawns(class'Pawn', P)
+    {
+        if (KFPawn_Monster(P) != None && P.Health > 5000)
+        {
+            if (BestBoss == None || P.Health > BestBoss.Health)
+            {
+                BestBoss = P;
+            }
+        }
+    }
+
+    CachedBossPawn = BestBoss;
+    return BestBoss;
+}
+
+function OnBotKilled(KF2Bot DeadBot)
+{
+    if (DeadBot == None) return;
+
+    if (DeadBot == VIPController)
+    {
+        HandleVIPSuccession();
+        UpdateMacroWaypoints();
+    }
+
+    UnregisterBot(DeadBot);
+}
+
+function int ComputeCommandScore(KF2Bot Bot)
+{
+    if (Bot == None || Bot.PlayerReplicationInfo == None || Bot.Pawn == None)
+        return -1;
+    return (Bot.PlayerReplicationInfo.Kills * 10) + Bot.Pawn.Health;
+}
+
+function KF2Bot FindBestCandidate(array<KF2Bot> Candidates)
+{
+    local int i;
+    local KF2Bot Best;
+    Best = None;
+    for (i = 0; i < Candidates.Length; i++)
+    {
+        if (Candidates[i] == None || Candidates[i].Pawn == None || Candidates[i].Pawn.Health <= 0)
+            continue;
+        if (Best == None || ComputeCommandScore(Candidates[i]) > ComputeCommandScore(Best))
+            Best = Candidates[i];
+    }
+    return Best;
+}
+
+function KF2Bot FindExpendableMember(array<KF2Bot> Candidates)
+{
+    local int i;
+    local KF2Bot Worst;
+    Worst = None;
+    for (i = 0; i < Candidates.Length; i++)
+    {
+        if (Candidates[i] == None || Candidates[i].bIsGroupLeader)
+            continue;
+        if (Candidates[i].Pawn == None || Candidates[i].Pawn.Health <= 0)
+            continue;
+        if (Worst == None || ComputeCommandScore(Candidates[i]) < ComputeCommandScore(Worst))
+            Worst = Candidates[i];
+    }
+    return Worst;
+}
+
+function HandleVIPSuccession()
+{
+    local KF2Bot Best;
+
+    Best = FindBestCandidate(ActiveBots);
+    if (Best == None) return; 
+
+    VIPController  = Best;
+    AlphaCommander = Best;
+    Best.bIsAlphaCommander = true;
+
+    if (Best.bIsGroupLeader)
+    {
+        DemoteGroupLeader(Best);
+    }
+}
+
+function HandleFireteamCasualty(KF2Bot DeadBot)
+{
+    local int GroupIdx, MemberIdx;
+    local bool bWasLeader;
+    local KF2Bot NewLeader;
+
+    if (DeadBot == None) return;
+
+    GroupIdx = DeadBot.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return;
+
+    bWasLeader = DeadBot.bIsGroupLeader;
+
+    MemberIdx = Fireteams[GroupIdx].Members.Find(DeadBot);
+    if (MemberIdx != INDEX_NONE)
+    {
+        Fireteams[GroupIdx].Members.Remove(MemberIdx, 1);
+    }
+
+    if (bWasLeader)
+    {
+        NewLeader = FindBestCandidate(Fireteams[GroupIdx].Members);
+        if (NewLeader != None)
+        {
+            NewLeader.bIsGroupLeader = true;
+            NewLeader.ResetStuckState();
+            Fireteams[GroupIdx].Leader = NewLeader;
+        }
+        else
+        {
+            Fireteams[GroupIdx].Leader = None;
+        }
+    }
+    ConsolidateFireteams();
+}
+
+function DemoteGroupLeader(KF2Bot OldLeader)
+{
+    local int GroupIdx, i;
+    local KF2Bot Candidate, NewLeader;
+    NewLeader = None;
+
+    if (OldLeader == None || !OldLeader.bIsGroupLeader) return;
+
+    GroupIdx = OldLeader.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return;
+
+    OldLeader.bIsGroupLeader = false;
+
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        Candidate = Fireteams[GroupIdx].Members[i];
+        if (Candidate == None || Candidate == OldLeader) continue;
+        if (Candidate.Pawn == None || Candidate.Pawn.Health <= 0) continue;
+
+        if (NewLeader == None || ComputeCommandScore(Candidate) > ComputeCommandScore(NewLeader))
+        {
+            NewLeader = Candidate;
+        }
+    }
+
+    if (NewLeader != None)
+    {
+        NewLeader.bIsGroupLeader = true;
+        NewLeader.ResetStuckState();
+        Fireteams[GroupIdx].Leader = NewLeader;
+    }
+    ConsolidateFireteams();
+}
+
+function RequestLeaderDemotion(KF2Bot StuckLeader)
+{
+    DemoteGroupLeader(StuckLeader);
+}
+
+function ConsolidateFireteams()
+{
+    local int GroupIdx;
+    if (Fireteams.Length > 0 && Fireteams[0].Members.Length < VIP_ESCORT_MIN_SIZE)
+    {
+        PullBotFromNearestGroup(0);
+    }
+    for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
+    {
+        if (Fireteams[GroupIdx].Members.Length == GROUP_DISSOLVE_SIZE)
+        {
+            DissolveGroup(GroupIdx);
+        }
+    }
+}
+
+function PullBotFromNearestGroup(int TargetGroupIdx)
+{
+    local int SourceGroupIdx, BestSourceIdx;
+    local float BestDistSq, DistSq;
+    local KF2Bot Puller;
+    local vector TargetLoc;
+
+    if (Fireteams[TargetGroupIdx].Leader == None || Fireteams[TargetGroupIdx].Leader.Pawn == None)
         return;
-    }
-    I = 0;
-    while(I < SquadSize.Length)
+
+    TargetLoc = Fireteams[TargetGroupIdx].Leader.Pawn.Location;
+    BestSourceIdx = INDEX_NONE;
+    BestDistSq = 0.0;
+
+    for (SourceGroupIdx = 0; SourceGroupIdx < Fireteams.Length; SourceGroupIdx++)
     {
-        if(SquadSize[I] < 4)
+        if (SourceGroupIdx == TargetGroupIdx) continue;
+        if (Fireteams[SourceGroupIdx].Members.Length <= 2) continue;
+        if (Fireteams[SourceGroupIdx].Leader == None || Fireteams[SourceGroupIdx].Leader.Pawn == None) continue;
+
+        DistSq = VSizeSq(Fireteams[SourceGroupIdx].Leader.Pawn.Location - TargetLoc);
+        if (BestSourceIdx == INDEX_NONE || DistSq < BestDistSq)
         {
-            ++SquadSize[I];
-            break;
-        }
-        ++I;
-    }
-
-    if(I == SquadSize.Length)
-    {
-        SquadSize.AddItem(byte(Rand(3) + 1));
-        SquadLeader.AddItem(B);
-    }
-    B.SquadID = I;
-    SetSquadLeader(B);
-    //return;    
-}
-
-final function SetSquadLeader(KF2Bot B)
-{
-    // End:0x64
-    if(SquadLeader[B.SquadID] == none)
-    {
-        SquadLeader[B.SquadID] = B;
-    }
-    B.BotLeader = SquadLeader[B.SquadID];
-    //return;    
-}
-
-final function FreeSquadID(KF2Bot B)
-{
-    // End:0xB9
-    if(B.SquadID != 255)
-    {
-        --SquadSize[B.SquadID];
-        // End:0xB9
-        if(SquadLeader[B.SquadID] == B)
-        {
-            SquadLeader[B.SquadID] = none;
+            BestSourceIdx = SourceGroupIdx;
+            BestDistSq = DistSq;
         }
     }
-    //return;    
+
+    if (BestSourceIdx == INDEX_NONE) return;
+
+    Puller = FindExpendableMember(Fireteams[BestSourceIdx].Members);
+    if (Puller == None) return;
+
+    ReassignBotToGroup(Puller, TargetGroupIdx);
 }
+
+function DissolveGroup(int GroupIdx)
+{
+    local KF2Bot Remaining;
+    local int NearestGroupIdx;
+
+    if (Fireteams[GroupIdx].Members.Length != GROUP_DISSOLVE_SIZE) return;
+
+    Remaining = Fireteams[GroupIdx].Members[0];
+    NearestGroupIdx = FindNearestEligibleGroup(GroupIdx, Remaining);
+
+    if (NearestGroupIdx == INDEX_NONE) return; 
+
+    Fireteams[GroupIdx].Members.Remove(0, 1);
+    Fireteams[GroupIdx].Leader = None;
+
+    ReassignBotToGroup(Remaining, NearestGroupIdx);
+}
+
+function int FindNearestEligibleGroup(int ExcludeGroupIdx, KF2Bot Bot)
+{
+    local int GroupIdx, BestIdx;
+    local float BestDistSq, DistSq;
+
+    if (Bot == None || Bot.Pawn == None) return INDEX_NONE;
+
+    BestIdx = INDEX_NONE;
+
+    for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
+    {
+        if (GroupIdx == ExcludeGroupIdx) continue;
+        if (Fireteams[GroupIdx].Members.Length < 2) continue;
+        if (Fireteams[GroupIdx].Leader == None || Fireteams[GroupIdx].Leader.Pawn == None) continue;
+
+        DistSq = VSizeSq(Fireteams[GroupIdx].Leader.Pawn.Location - Bot.Pawn.Location);
+        if (BestIdx == INDEX_NONE || DistSq < BestDistSq)
+        {
+            BestIdx = GroupIdx;
+            BestDistSq = DistSq;
+        }
+    }
+    return BestIdx;
+}
+
+function ReassignBotToGroup(KF2Bot Bot, int NewGroupIdx)
+{
+    local int OldGroupIdx, MemberIdx;
+
+    if (Bot == None) return;
+
+    OldGroupIdx = Bot.GroupID - 1;
+    if (OldGroupIdx >= 0 && OldGroupIdx < Fireteams.Length)
+    {
+        MemberIdx = Fireteams[OldGroupIdx].Members.Find(Bot);
+        if (MemberIdx != INDEX_NONE)
+        {
+            Fireteams[OldGroupIdx].Members.Remove(MemberIdx, 1);
+        }
+    }
+
+    Bot.bIsGroupLeader = false;
+    Bot.GroupID = NewGroupIdx + 1;
+    Bot.ResetStuckState();
+    Fireteams[NewGroupIdx].Members.AddItem(Bot);
+
+    if (Fireteams[NewGroupIdx].Leader != None)
+    {
+        Bot.AssignedAnchor = Fireteams[NewGroupIdx].Leader.AssignedAnchor;
+    }
+}
+
+function KF2Bot GetGroupLeader(int GroupID)
+{
+    local int GroupIdx;
+    GroupIdx = GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return None;
+    return Fireteams[GroupIdx].Leader;
+}
+
+function int GetGroupSize(int GroupID)
+{
+    local int GroupIdx;
+    GroupIdx = GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return 0;
+    return Fireteams[GroupIdx].Members.Length;
+}
+
+function int GetFollowerIndex(KF2Bot Bot)
+{
+    local int GroupIdx, i, FollowerCount;
+
+    if (Bot == None) return 1;
+
+    GroupIdx = Bot.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return 1;
+
+    FollowerCount = 0;
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        if (Fireteams[GroupIdx].Members[i] == Fireteams[GroupIdx].Leader) continue;
+        FollowerCount++;
+        if (Fireteams[GroupIdx].Members[i] == Bot) return FollowerCount;
+    }
+    return FollowerCount + 1;
+}
+
+// Bot self-registration is handled in KF2Bot.PreBeginPlay() via mut.RegisterBot(self).
+// The actual bot spawning is done by final function bool AddBot() below.
 
 function CheckWave()
 {
@@ -681,7 +1228,6 @@ final function bool AddBot()
     }
     B.Perk = PickBotPerk();
 
-    SetSquadID(B);
     PRI = KFPlayerReplicationInfo(B.PlayerReplicationInfo);
     // End:0x254
     if(PRI != none)
