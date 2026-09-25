@@ -35,6 +35,7 @@ var() config bool bBotsUnlimitedCash;
 var config string _Separator5;
 var() config bool bNoZerkerBots;
 var() config bool bUseCustomBotNames;
+var() config bool bShowBotLevel;
 var() config array<string> CustomBotNames;
 // Perk class names only (e.g. "KFPerk_Berserker"), NOT full paths - these
 // are resolved against the live PerkList at runtime (see ResolvePerkByName),
@@ -86,6 +87,7 @@ function PostBeginPlay()
         BotsDamageScale = 1.0;
         ZedCountScaling = 0.2;
         bUseCustomBotNames = true;
+        bShowBotLevel = false;
         CustomBotNames.Length = 0;
         CustomBotNames.AddItem("Alex");
         CustomBotNames.AddItem("Reaper");
@@ -539,6 +541,10 @@ final function InitBotCharacter(KF2Bot Bot)
         }
     }
     
+    if(bShowBotLevel)
+    {
+        BotName = ("[Lv" $ string(lvl) $ "] ") $ BotName;
+    }
     if(PRI != none)
     {
         PRI.SetPlayerName(BotName);
@@ -912,6 +918,7 @@ function Mutate(string MutateString, PlayerController Sender)
             PMsg(Sender, ("-SetBotDamageScale <" $ string(BotsDamageScale)) $ "> = Damage scaling bots should take");
             PMsg(Sender, ("-SetBotInfDosh <" $ string(bBotsUnlimitedCash)) $ "> = Bots have unlimited spending cash");
             PMsg(Sender, ("-SetUseCustomNames <" $ string(bUseCustomBotNames)) $ "> = Use CustomBotNames instead of look-based names");
+            PMsg(Sender, ("-SetBotsLevel <" $ string(bShowBotLevel)) $ "> = Show [Lv X] prefix on bot names");
         }
         else if(Left(MutateString, 11) ~= "SetNumBots ")
         {
@@ -966,6 +973,12 @@ function Mutate(string MutateString, PlayerController Sender)
             bUseCustomBotNames = bool(Mid(MutateString, 18));
             SaveConfig();
             PMsg(Sender, "Bots use custom name pool: " $ string(bUseCustomBotNames));
+        }
+        else if(Left(MutateString, 11) ~= "SetBotsLevel ")
+        {
+            bShowBotLevel = bool(Mid(MutateString, 11));
+            SaveConfig();
+            PMsg(Sender, "Bots show [Lv X] name prefix: " $ string(bShowBotLevel));
         }
         else if(Left(MutateString, 18) ~= "SetBotDamageScale ")
         {
