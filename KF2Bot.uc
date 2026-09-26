@@ -34,6 +34,37 @@ const DOOR_CHECK_RADIUS     = 200.0;
 const SINGLE_FILE_SPACING = 130.0;
 const PERIMETER_RADIUS    = 220.0;
 const DEG_TO_RAD          = 0.0174532925;
+
+// ============================================================
+//  MASTER DESIGN DOC PATCH — throttle/priority constants
+// ============================================================
+const SYG_DISTANCE_SQ               = 1000000.0;  // P5: 1000u
+const BOSS_HEALTH_THRESHOLD         = 5000;       // P7 boss classification
+
+const RETREAT_ZED_RADIUS            = 500.0;      // P4
+const RETREAT_ZED_TRIGGER_COUNT     = 4;
+const RETREAT_ZED_CLEAR_COUNT       = 2;
+const RETREAT_HEAVY_RADIUS          = 300.0;
+const FOLLOWER_DRIFT_SQ             = 250000.0;   // 500u
+
+const TRIAGE_INTERVAL               = 2.0;        // P6
+const VIP_TRIAGE_GATE_PCT           = 50.0;
+const VIP_TRIAGE_BONUS_PCT          = 15.0;
+
+const ENEMY_SCAN_INTERVAL           = 0.5;        // P7
+const ENEMY_SCAN_RADIUS             = 1500.0;
+const SPOT_RADIUS_SQ                = 4000000.0;  // 2000u
+const LEASH_DROP_DIST_SQ            = 5760000.0;  // 2400u
+const LEASH_COOLDOWN                = 2.0;
+
+const ZED_COUNT_INTERVAL            = 1.0;        // P4 perf gate
+
+const OBJECTIVE_HAZARD_RADIUS       = 800.0;      // P5
+const OBJECTIVE_HAZARD_ZED_COUNT    = 3;
+const SIREN_CHECK_RADIUS            = 1200.0;
+
+const TRADER_MAX_RETRIES            = 3;          // P9
+const TRADER_GIVEUP_COOLDOWN        = 10.0;
 var transient byte CallStack;
 var byte MoveFlags;
 var byte HealingStage;
@@ -79,6 +110,29 @@ var Actor Target;
 var bool bSerpentineMove;
 var bool bSerpentLeft;
 var bool bBossKillVictory;
+
+// P1 — terminal-state lock
+var bool bInTerminalState;
+
+// P4 — Tactical Retreat
+var bool  bIsRetreating;
+var float LastZedCountTime;
+var int   CachedZedCount;
+var bool  bCachedHeavyZed;
+
+// P8 EvaluateFollowerMove — Retreat Paradox hold-position
+var bool   bHasHoldPosition;
+var vector HoldPosition;
+
+// P6 — triage throttle
+var float LastTriageTime;
+
+// P7 — enemy scan throttle + leash cooldown
+var float LastEnemyScanTime;
+var float LastLeashDropTime;
+
+// P9 — trader bodyblock bounded retry
+var int TraderRetryCount;
 
 simulated function PreBeginPlay()
 {
@@ -377,12 +431,20 @@ final function bool TargetLowHealth(Pawn Other)
 
 function EyeSightCheck()
 {
-    // End:0x3D
     if((Pawn != none) && Pawn.IsAliveAndWell())
     {
+        // Performance Gate: only re-scan for a new/better target when we
+        // don't already have a live one, and no more than once every
+        // ENEMY_SCAN_INTERVAL seconds. NotifyKilled's direct call to
+        // PickNextEnemy() (immediate re-acquire right after a kill) is
+        // deliberately NOT gated by this — that call already runs on a
+        // kill event, not per-tick.
+        if (Enemy != none && Enemy.IsAliveAndWell()) return;
+        if (WorldInfo.TimeSeconds - LastEnemyScanTime < ENEMY_SCAN_INTERVAL) return;
+
+        LastEnemyScanTime = WorldInfo.TimeSeconds;
         PickNextEnemy();
     }
-    //return;    
 }
 
 final function bool PickNextEnemy()
@@ -390,11 +452,18 @@ final function bool PickNextEnemy()
     local KFPawn_Monster P;
     local bool bResult;
 
-    bResult = false;
-    // End:0x113
-    foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Monster', P, Pawn.Location, 1500.0000000)
+    // P7 Leash Cooldown (Loophole 3): after dropping a target for being
+    // too far away, don't immediately re-scan and grab the next best thing
+    // — wait out the cooldown so a distance-hovering target doesn't thrash
+    // the bot between FightEnemy/Hunting and this scan every tick.
+    if (WorldInfo.TimeSeconds - LastLeashDropTime < LEASH_COOLDOWN)
     {
-        // End:0x112
+        return false;
+    }
+
+    bResult = false;
+    foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Monster', P, Pawn.Location, ENEMY_SCAN_RADIUS)
+    {
         if(((P != Pawn) && P.IsAliveAndWell()) && FastTrace(P.Location, Pawn.Location))
         {
             bResult = (SetEnemy(P, true)) || bResult;
@@ -406,20 +475,28 @@ final function bool PickNextEnemy()
 
 function bool SetEnemy(Pawn Other, optional bool bNoNotify)
 {
-    // End:0xDB
     if(((((Other == none) || Other == Pawn) || Other.SpawnTime == WorldInfo.TimeSeconds) || !Other.IsAliveAndWell()) || (KFPawn_Monster(Other) != none) && KFPawn_Monster(Other).bIsHeadless)
     {
         return false;
     }
-    // End:0x27F
+
+    // Boss-Melee Guard (Loophole 1): a bot with nothing but melee left
+    // must never target a boss-tier Zed. This is the single choke point
+    // every acquisition path (native notifies, PickNextEnemy(), and the
+    // leader-spotter broadcast below) funnels through — but it only
+    // catches acquisition-time melee state; see FightEnemy.PickStyle()
+    // for the ammo-depletes-mid-fight case this alone can't catch.
+    if (Other.Health > BOSS_HEALTH_THRESHOLD && IsMeleeOnly())
+    {
+        return false;
+    }
+
     if(Pawn.IsSameTeam(Other))
     {
-        // End:0x19A
         if((((((PlayStyle == 1) && KPawn != none) && FollowingHuman == none) && KFPawn_Human(Other) != none) && Other.IsHumanControlled()) && Rand(3) == 0)
         {
             FollowingHuman = Other;
         }
-        // End:0x27D
         if(((((Enemy == none) && NextDoshShareTime > WorldInfo.TimeSeconds) && PlayerReplicationInfo.Score > float(800)) && Other.PlayerReplicationInfo != none) && Other.PlayerReplicationInfo.Score < float(500))
         {
             DonateMoney(Other);
@@ -427,17 +504,24 @@ function bool SetEnemy(Pawn Other, optional bool bNoNotify)
         return false;
     }
     EnemyEncounterTime = WorldInfo.TimeSeconds;
-    // End:0x2E5
     if((Enemy != none) && (GetEnemyThreat(Enemy)) > (GetEnemyThreat(Other)))
     {
         return false;
     }
     Enemy = Other;
-    // End:0x311
     if(!bNoNotify)
     {
         EnemyChanged();
     }
+
+    // P7 Spotter (leader-only): share a close-range target with followers
+    // who don't already have a live Enemy of their own, instead of making
+    // them wait for their own FastTrace scan to independently spot it.
+    if (bIsGroupLeader && mut != none && VSizeSq(Other.Location - Pawn.Location) <= SPOT_RADIUS_SQ)
+    {
+        mut.BroadcastSpottedEnemy(GroupID, Other);
+    }
+
     return true;
     //return ReturnValue;    
 }
@@ -1245,7 +1329,7 @@ event bool NotifyHitWall(Vector HitNormal, Actor Wall)
 
 function FinishedMove()
 {
-    //return;    
+    PickCombatStyle();
 }
 
 final function PickFavorite()
@@ -1559,7 +1643,8 @@ final function bool CheckShouldHealMate()
 {
     local KFWeap_HealerBase W;
     local KFPawn_Human P, Best;
-    local float Pct, BestPct, DHoriz, DVert;
+    local float Pct, DHoriz, DVert;
+    local float EffectivePct, BestEffectivePct;
 
     if(mut == none)
     {
@@ -1585,7 +1670,7 @@ final function bool CheckShouldHealMate()
     }
 
     Best = none;
-    BestPct = 0.0000000;
+    BestEffectivePct = 0.0000000;
     foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Human', P, Pawn.Location, mut.HealCylinderRadius)
     {
         if(P == Pawn)
@@ -1627,10 +1712,22 @@ final function bool CheckShouldHealMate()
         {
             continue;
         }
-        if((Best == none) || (Pct < BestPct))
+
+        // P6 VIP Triage Bias fix (Loophole 2): only nudge priority toward
+        // the VIP when they're already seriously wounded (<50% HP), and by
+        // a bounded amount — a lightly-scratched VIP can never leapfrog a
+        // critically wounded teammate, but a genuinely wounded VIP in a
+        // close call still wins.
+        EffectivePct = Pct;
+        if((mut.VIPController != none) && (P == mut.VIPController.Pawn) && (Pct < VIP_TRIAGE_GATE_PCT))
+        {
+            EffectivePct = FMax(Pct - VIP_TRIAGE_BONUS_PCT, 0.0);
+        }
+
+        if((Best == none) || (EffectivePct < BestEffectivePct))
         {
             Best = P;
-            BestPct = Pct;
+            BestEffectivePct = EffectivePct;
         }
     }
 
@@ -1641,7 +1738,8 @@ final function bool CheckShouldHealMate()
 final function bool CheckMedicGunHeal()
 {
     local KFPawn_Human P, Best;
-    local float Pct, BestPct;
+    local float Pct;
+    local float EffectivePct, BestEffectivePct;
 
     if(mut == none)
     {
@@ -1663,7 +1761,7 @@ final function bool CheckMedicGunHeal()
     }
 
     Best = none;
-    BestPct = 0.0000000;
+    BestEffectivePct = 0.0000000;
     foreach WorldInfo.AllPawns(Class'KFGame.KFPawn_Human', P, Pawn.Location, 1800.0000000)
     {
         if(P == Pawn)
@@ -1691,10 +1789,17 @@ final function bool CheckMedicGunHeal()
         {
             continue;
         }
-        if((Best == none) || (Pct < BestPct))
+
+        EffectivePct = Pct;
+        if((mut.VIPController != none) && (P == mut.VIPController.Pawn) && (Pct < VIP_TRIAGE_GATE_PCT))
+        {
+            EffectivePct = FMax(Pct - VIP_TRIAGE_BONUS_PCT, 0.0);
+        }
+
+        if((Best == none) || (EffectivePct < BestEffectivePct))
         {
             Best = P;
-            BestPct = Pct;
+            BestEffectivePct = EffectivePct;
         }
     }
 
@@ -1705,7 +1810,6 @@ final function bool CheckMedicGunHeal()
 final function bool CheckShouldSelfHeal()
 {
     local KFWeap_HealerBase W;
-    local float Pct;
 
     if(mut == none)
     {
@@ -1716,12 +1820,12 @@ final function bool CheckShouldSelfHeal()
         return false;
     }
 
-    Pct = (float(KPawn.Health) / float(KPawn.HealthMax)) * 100.0000000;
-    if(Pct > mut.HealMinHealthPct)
-    {
-        return false;
-    }
-    if(!TargetLowHealth(KPawn))
+    // P3 Critical Survival: flat 25% HealthMax threshold, replacing the
+    // old HealMinHealthPct(60%) + TargetLowHealth() time-decay gate for
+    // THIS specific self-preservation check. HealMinHealthPct/
+    // TargetLowHealth() remain unchanged and still gate P6 (healing
+    // OTHER teammates) below.
+    if (KPawn.Health >= 0.25 * KPawn.HealthMax)
     {
         return false;
     }
@@ -1794,6 +1898,16 @@ function CheckGrabbed()
 
 function PickCombatStyle()
 {
+    // P1 Terminal Lock: once bInTerminalState is set, every other state's
+    // re-evaluation call (FinishedMove/Timer/EnemyChanged/NotifyKilled —
+    // all of which funnel through here) routes back into VictoryDance
+    // instead of GotoState('PickNextMove'), so nothing can pull the bot
+    // back into the behavior tree after the match is over.
+    if (bInTerminalState)
+    {
+        GotoState('VictoryDance');
+        return;
+    }
     GotoState('PickNextMove');
     //return;    
 }
@@ -1988,8 +2102,14 @@ simulated event ReplicatedEvent(name VarName)
             break;
         // End:0x4D
         case 'EndRagdollMove':
-            GotoState('PickNextMove');
-            // End:0x50
+            if (bInTerminalState)
+            {
+                GotoState('VictoryDance');
+            }
+            else
+            {
+                GotoState('PickNextMove');
+            }
             break;
         // End:0xFFFF
         default:
@@ -2088,19 +2208,62 @@ state PickNextMove
 
     function PickMove()
     {
-        // Priority 1: Match Ended check (Evaluated natively via VictoryDance state changes)
-        // Priority 2: Grabbed Override (Evaluated via CheckGrabbed / BreakLose state)
+        // Priority 1: Match Ended — terminal, no further evaluation. Guarded
+        // centrally in PickCombatStyle() too; this copy covers the direct
+        // GotoState('PickNextMove') from ReplicatedEvent('EndRagdollMove').
+        if (bInTerminalState)
+        {
+            GotoState('VictoryDance');
+            return;
+        }
+        if (mut != none && mut.KF != none && mut.KF.MyKFGRI != none && mut.KF.MyKFGRI.bMatchIsOver)
+        {
+            GotoState('VictoryDance');
+            return;
+        }
 
-        // Priority 3: Critical Survival
-        if (KPawn != none && TargetLowHealth(Pawn) && CheckShouldSelfHeal())
+        // Priority 2: Grabbed Override — handled as an async interrupt via
+        // CheckGrabbed()/BreakLose (see Restart()'s timer), not as a
+        // sequential branch here. Per Design Doc §2.3.
+
+        // Priority 3: Critical Survival — Health < 25% HealthMax.
+        if (KPawn != none && CheckShouldSelfHeal())
         {
             GotoState('HealingSelf');
             return;
         }
 
-        // Priority 6: Squad Medic
-        if (KPawn != none)
+        // Priority 4: Tactical Retreat — leader-only trigger; followers react
+        // passively via EvaluateFollowerMove()'s Leader.bIsRetreating check
+        // during P8 below.
+        if (bIsGroupLeader && KPawn != none && !bIsRetreating && ShouldTacticalRetreat())
         {
+            bIsRetreating = true;
+            GotoState('TacticalRetreat');
+            return;
+        }
+
+        // Priority 5: SYG Enforcement — only forces the objective path when
+        // actually outside the zone (>1000u); otherwise falls through so
+        // Medic/Combat can still run.
+        if (mut.bObjectiveActive)
+        {
+            if (ObjectiveGoal == none)
+            {
+                ObjectiveGoal = mut.GetBotObjective(self);
+            }
+            if (ObjectiveGoal != none && VSizeSq(ObjectiveGoal.Location - Pawn.Location) > SYG_DISTANCE_SQ)
+            {
+                GotoState('DoObjective');
+                return;
+            }
+        }
+
+        // Priority 6: Squad Medic (Triage) — 2.0s throttle shared by both the
+        // dart (ranged) and syringe (melee-range) triage scans.
+        if (KPawn != none && WorldInfo.TimeSeconds - LastTriageTime >= TRIAGE_INTERVAL)
+        {
+            LastTriageTime = WorldInfo.TimeSeconds;
             if (CheckMedicGunHeal())
             {
                 GotoState('HealRanged');
@@ -2113,34 +2276,37 @@ state PickNextMove
             }
         }
 
-        // Priority 7: Combat Engagement
+        // Priority 7: Combat Engagement — boss-melee targets are already
+        // filtered at the source in SetEnemy()/FightEnemy.PickStyle(). Leash:
+        // drop and cooldown past 2400u instead of thrashing.
         if (Enemy != none && Enemy.IsAliveAndWell() && !(KFPawn_Monster(Enemy) != none && KFPawn_Monster(Enemy).bIsHeadless))
         {
-            if (LineOfSightTo(Enemy))
+            if (VSizeSq(Enemy.Location - Pawn.Location) > LEASH_DROP_DIST_SQ)
+            {
+                Enemy = none;
+                LastLeashDropTime = WorldInfo.TimeSeconds;
+            }
+            else if (LineOfSightTo(Enemy))
             {
                 GotoState('FightEnemy');
                 return;
             }
-            GotoState('Hunting');
-            return;
+            else
+            {
+                GotoState('Hunting');
+                return;
+            }
         }
 
-        // Priority 9: Economy
+        // Priority 8: Squad Tethering
+        if (EvaluateSquadTether()) return;
+
+        // Priority 9: Economy — only reachable once SYG (P5) is satisfied.
         if (KFGRI.bTraderIsOpen && NextShoppingTime < WorldInfo.TimeSeconds && KFGRI.OpenedTrader != none)
         {
             GotoState('GoShopping');
             return;
         }
-
-        // Priority 5: SYG Enforcement
-        if (mut.bObjectiveActive)
-        {
-            GotoState('DoObjective');
-            return;
-        }
-
-        // Priority 8: Squad Tethering
-        if (EvaluateSquadTether()) return;
 
         // Priority 10: Camp
         ExecuteCampState();
@@ -2155,6 +2321,13 @@ Begin:
 function bool EvaluateSquadTether()
 {
     if (Pawn == None || mut == None) return false;
+    // Trader bypass: if the trader is open and shopping is due,
+    // skip tethering so the bot falls through to P9 (Economy).
+    if (KFGRI != None && KFGRI.bTraderIsOpen && KFGRI.OpenedTrader != None
+        && NextShoppingTime < WorldInfo.TimeSeconds)
+    {
+        return false;
+    }
     if (!IsAnchorValid(AssignedAnchor)) return false;
     if (bIsGroupLeader) return EvaluateLeaderMove();
     return EvaluateFollowerMove();
@@ -2183,7 +2356,36 @@ function bool EvaluateFollowerMove()
     local vector FormationGoal;
 
     Leader = mut.GetGroupLeader(GroupID);
-    if (Leader == None || Leader.bIsStuck || Leader.Pawn == None || Leader.Pawn.Health <= 0)
+
+    // GC null-check — Leader can be killed/demoted mid-evaluation.
+    if (Leader == None || Leader.Pawn == None || Leader.Pawn.Health <= 0)
+    {
+        bHasHoldPosition = false;
+        return MoveTowardGoal(AssignedAnchor, vect(0,0,0), true);
+    }
+
+    // P4 Retreat Paradox fix (Loophole 4): while the leader is actively
+    // retreating, followers hold their current ground instead of tethering
+    // toward AssignedAnchor — which may sit back on the far side of the
+    // horde the leader is falling back from — rather than walking straight
+    // into it.
+    if (Leader.bIsRetreating)
+    {
+        if (!bHasHoldPosition)
+        {
+            HoldPosition = Pawn.Location;
+            bHasHoldPosition = true;
+        }
+        if (VSizeSq(Pawn.Location - HoldPosition) > FOLLOWER_DRIFT_SQ)
+        {
+            return MoveTowardGoal(None, HoldPosition, false);
+        }
+        Pawn.Acceleration = vect(0.0, 0.0, 0.0);
+        return false;
+    }
+    bHasHoldPosition = false;
+
+    if (Leader.bIsStuck)
     {
         return MoveTowardGoal(AssignedAnchor, vect(0,0,0), true);
     }
@@ -2287,6 +2489,13 @@ function UpdatePillarOfSaltTracking()
         bFoundDoor = false;
         foreach Pawn.OverlappingActors(class'KFDoorMarker', Marker, DOOR_CHECK_RADIUS)
         {
+            // Ghost Door GC fix (Loophole 5): KFDoorMarker can persist on the nav
+            // mesh after its KFDoorActor is destroyed/opened/unwelded — marker
+            // presence alone isn't enough, verify the door is still a real,
+            // closed, welded obstruction.
+            if (Marker.MyKFDoor == none || Marker.MyKFDoor.bIsDestroyed) continue;
+            if (Marker.MyKFDoor.bIsDoorOpen || Marker.MyKFDoor.WeldIntegrity <= 0) continue;
+
             bFoundDoor = true;
             break;
         }
@@ -2313,9 +2522,9 @@ function UpdatePillarOfSaltTracking()
 
 function bool ExecuteCampState()
 {
-    // Phase 2: implement camp/hide behavior
-    // Phase 1 fallback: route to Roaming (existing idle state)
-    GotoState('Roaming');
+    // P10 Camp: dedicated stationary hold — replaces the fallback into
+    // Roaming (which would wander via BuildRandomPath()).
+    GotoState('Camp');
     return true;
 }
 
@@ -2500,6 +2709,33 @@ Camp:
     stop;        
 }
 
+state Camp
+{
+    event BeginState(name PreviousStateName)
+    {
+        AbortMove();
+        if (KPawn != none)
+        {
+            KPawn.SetSprinting(false);
+        }
+    }
+
+    function EnemyChanged()
+    {
+        PickCombatStyle();
+    }
+Begin:
+    if (Pawn.Physics == 2)
+    {
+        WaitForLanding();
+    }
+    Focus = none;
+    SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
+    Sleep(1.0000000 + FRand());
+    PickCombatStyle();
+    stop;
+}
+
 state DoObjective extends Roaming
 {
     function FinishObjective()
@@ -2511,21 +2747,34 @@ state DoObjective extends Roaming
 
     function PickStyle()
     {
-        // End:0x39
+        // P5 SYG Death March fix (Loophole 7): assess the approach corridor
+        // for hazards before committing to another leg of the path.
+        if (CheckObjectiveHazard())
+        {
+            return;
+        }
+
         if(ObjectiveGoal == none)
         {
             ObjectiveGoal = mut.GetBotObjective(self);
         }
-        // End:0xD9
+
+        // GC Null-Check: ObjectiveGoal can still be None here (objective
+        // cleared between the check above and now) — don't dereference
+        // .Location below.
+        if (ObjectiveGoal == none)
+        {
+            PickCombatStyle();
+            return;
+        }
+
         if(VSizeSq(ObjectiveGoal.Location - Pawn.Location) > 90000.0000000)
         {
-            // End:0xA9
             if(ActorReachable(ObjectiveGoal))
             {
                 MoveTowardX(ObjectiveGoal);
                 return;
             }
-            // End:0xD6
             if(BuildPathToward(ObjectiveGoal))
             {
                 MoveTowardX(MoveTarget);
@@ -2538,7 +2787,6 @@ state DoObjective extends Roaming
             SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
             return;
         }
-        // End:0x17F
         if((RandGoal == none) && !BuildRandomPath())
         {
             J0x148:
@@ -2546,18 +2794,15 @@ state DoObjective extends Roaming
             MoveToX(Pawn.Location + (VRand() * 300.0000000));
             return;
         }
-        // End:0x1B0
         if(ActorReachable(RandGoal))
         {
             MoveTowardX(RandGoal);
             RandGoal = none;
             return;
         }
-        // End:0x1D6
         if(!BuildPathToward(RandGoal))
         {
             RandGoal = none;
-            // [Loop Continue]
             goto J0x148;
         }
         MoveTowardX(MoveTarget);
@@ -2640,21 +2885,20 @@ state FightEnemy
         // End:0xF8
         if(mut.bObjectiveActive)
         {
-            // End:0x5B
             if(ObjectiveGoal == none)
             {
                 ObjectiveGoal = mut.GetBotObjective(self);
             }
-            // End:0xF8
-            if(VSizeSq(ObjectiveGoal.Location - Pawn.Location) > 640000.0000000)
+            // GC Null-Check: GetBotObjective() can still return None (objective
+            // cleared / ValidPoints emptied between the check above and here) —
+            // guard before dereferencing .Location.
+            if(ObjectiveGoal != none && VSizeSq(ObjectiveGoal.Location - Pawn.Location) > 640000.0000000)
             {
-                // End:0xCB
                 if(ActorReachable(ObjectiveGoal))
                 {
                     MoveTowardX(ObjectiveGoal);
                     return;
                 }
-                // End:0xF8
                 if(BuildPathToward(ObjectiveGoal))
                 {
                     MoveTowardX(MoveTarget);
@@ -2686,8 +2930,20 @@ state FightEnemy
                 }
             }
         }
-        bMelee = ((Pawn.Weapon != none) ? Pawn.Weapon.bMeleeWeapon : !Pawn.HasRangedAttack());
-        // End:0x44E
+        bMelee = IsMeleeOnly();
+
+        // Boss-Melee Guard (Loophole 1) — primary fix point: an ammo-depleted
+        // mid-fight weapon switch (FireWeaponAt() -> SwitchToBestWeapon() ->
+        // melee fallback) surfaces HERE, since SetEnemy() only gates at initial
+        // acquisition and isn't re-invoked when ammo runs dry later in the same
+        // engagement. Re-checked every time PickStyle() runs (state re-entry),
+        // so this closes the loop within one FinishedMove() re-evaluation cycle.
+        if (bMelee && Enemy.Health > BOSS_HEALTH_THRESHOLD)
+        {
+            Enemy = none;
+            PickCombatStyle();
+            return;
+        }
         if((((KPawn != none) || !bMelee) && !bMelee || (Vector(Enemy.Rotation) Dot (Enemy.Location - Pawn.Location)) < 0.0000000) && VSizeSq(Enemy.Location - Pawn.Location) < ((Enemy.Health > 500) ? 250000.0000000 : 14400.0000000))
         {
             PickRetreatMove();            
@@ -2802,6 +3058,122 @@ final function int CountNearbyZeds(float Radius)
     //return ReturnValue;
 }
 
+// ============================================================
+//  New helper functions (P4/P5/P7) — inserted after CountNearbyZeds()
+// ============================================================
+
+// AreZedsNear/HeavyZedWithin: KF2Bot extends the plain engine AIController
+// (not KFAIController), so unlike the native SDK helpers referenced in the
+// Design Doc, these don't already exist here — added fresh to match the
+// signatures used throughout this patch.
+final function bool AreZedsNear(vector Loc, bool bRequireCanSee, float CheckRadius, int MinimalCount)
+{
+    local KFPawn_Monster Z;
+    local int ZedCount;
+
+    ZedCount = 0;
+    foreach WorldInfo.AllPawns(class'KFGame.KFPawn_Monster', Z, Loc, CheckRadius)
+    {
+        if (Z == none || !Z.IsAliveAndWell()) continue;
+        if (bRequireCanSee && !FastTrace(Z.Location, Loc)) continue;
+
+        ++ZedCount;
+        if (ZedCount >= MinimalCount) return true;
+    }
+    return false;
+}
+
+// HeavyZedWithin — FINAL VERSION (bLargeZed + Siren class check).
+// bLargeZed catches Scrake (1100 HP), Fleshpound (1500 HP), Hans, Patriarch.
+// Explicit Siren class check catches KFPawn_ZedSiren (230 HP, NOT bLargeZed).
+final function bool HeavyZedWithin(float Radius)
+{
+    local KFPawn_Monster Z;
+
+    if (Pawn == none) return false;
+
+    foreach WorldInfo.AllPawns(class'KFGame.KFPawn_Monster', Z, Pawn.Location, Radius)
+    {
+        if (Z == none || !Z.IsAliveAndWell()) continue;
+
+        if (Z.bLargeZed || Z.Class == class'KFGameContent.KFPawn_ZedSiren')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+final function bool ShouldTacticalRetreat()
+{
+    if (Pawn == none) return false;
+
+    // P4 Performance Gate: leader-only zed density scan, refreshed at most
+    // once per ZED_COUNT_INTERVAL rather than every PickMove() tick.
+    if (WorldInfo.TimeSeconds - LastZedCountTime >= ZED_COUNT_INTERVAL)
+    {
+        LastZedCountTime = WorldInfo.TimeSeconds;
+        CachedZedCount   = CountNearbyZeds(RETREAT_ZED_RADIUS);
+        bCachedHeavyZed  = HeavyZedWithin(RETREAT_HEAVY_RADIUS);
+    }
+
+    return (CachedZedCount >= RETREAT_ZED_TRIGGER_COUNT) || bCachedHeavyZed;
+}
+
+final function bool IsMeleeOnly()
+{
+    if (Pawn == none) return false;
+    return (Pawn.Weapon != none) ? Pawn.Weapon.bMeleeWeapon : !Pawn.HasRangedAttack();
+}
+
+// P5 SYG Death March fix (Loophole 7). Returns true if it took over
+// PickStyle() this call (either engaging a hazard, or holding position
+// waiting for one to resolve) — caller should return immediately.
+final function bool CheckObjectiveHazard()
+{
+    local KFPawn_Monster P;
+
+    if (Pawn == none) return false;
+
+    // Siren check: engage a nearby Siren before pushing further into the
+    // objective corridor. Identified by class, not HP — Sirens are a
+    // ranged/scream hazard, not a high-health one.
+    foreach WorldInfo.AllPawns(class'KFGame.KFPawn_Monster', P, Pawn.Location, SIREN_CHECK_RADIUS)
+    {
+        if (P == none || !P.IsAliveAndWell()) continue;
+        if (P.Class == class'KFGameContent.KFPawn_ZedSiren' && FastTrace(Pawn.Location, P.Location))
+        {
+            SetEnemy(P, true);
+            GotoState('FightEnemy');
+            return true;
+        }
+    }
+
+    if (!AreZedsNear(Pawn.Location, false, OBJECTIVE_HAZARD_RADIUS, OBJECTIVE_HAZARD_ZED_COUNT))
+    {
+        return false; // corridor is clear — safe to path
+    }
+
+    // Dense crowd in the approach corridor: fight through it first instead
+    // of marching past/into it.
+    if (Enemy == none || !Enemy.IsAliveAndWell())
+    {
+        PickNextEnemy();
+    }
+    if (Enemy != none && Enemy.IsAliveAndWell())
+    {
+        GotoState('FightEnemy');
+        return true;
+    }
+
+    // Zeds are near but nothing is actually targetable yet (e.g. around a
+    // corner) — hold this PickStyle() call rather than pathing blindly
+    // into them; the next call retries.
+    Focus = none;
+    SetFocalPoint(Pawn.Location + (VRand() * 300.0));
+    return true;
+}
+
 // Last-resort escape used by BreakLose once a grab has gone on longer
 // than FailsafeActivationDelay: forces the special move to end on both
 // sides of the grab rather than continuing to rely on the mash input
@@ -2851,6 +3223,70 @@ final function ForceBreakGrapple()
     KPawn.EndSpecialMove();
     KPawn.InteractionPawn = none;
     //return;
+}
+
+state TacticalRetreat
+{
+    event BeginState(name PreviousStateName)
+    {
+        AbortMove();
+        bIsRetreating = true;
+        if (KPawn != none)
+        {
+            KPawn.SetSprinting(true);
+        }
+        SetTimer(ZED_COUNT_INTERVAL, true, 'CheckRetreatStatus');
+    }
+
+    event EndState(name NextStateName)
+    {
+        ClearTimer('CheckRetreatStatus');
+        bIsRetreating = false;
+        if (KPawn != none)
+        {
+            KPawn.SetSprinting(false);
+        }
+    }
+
+    function CheckRetreatStatus()
+    {
+        if (Pawn == none || Pawn.Health <= 0)
+        {
+            return;
+        }
+
+        // Hysteresis: only stand down once the crowd has genuinely thinned
+        // (< RETREAT_ZED_CLEAR_COUNT), not merely dropped below the entry
+        // trigger — avoids flickering in and out of TacticalRetreat.
+        if (CountNearbyZeds(RETREAT_ZED_RADIUS) < RETREAT_ZED_CLEAR_COUNT && !HeavyZedWithin(RETREAT_HEAVY_RADIUS))
+        {
+            bIsRetreating = false;
+            PickCombatStyle();
+        }
+    }
+
+    function FinishedMove()
+    {
+        // Latent retreat step landed — keep falling back in bursts while
+        // still in danger. CheckRetreatStatus() decides when to stand down.
+        if (bIsRetreating)
+        {
+            PickRetreatMove();
+        }
+    }
+
+    function EnemyChanged()
+    {
+        // Deliberately ignored — P4 overrides P7: a newly spotted Zed must
+        // not interrupt an active retreat.
+    }
+Begin:
+    if (Pawn.Physics == 2)
+    {
+        WaitForLanding();
+    }
+    PickRetreatMove();
+    stop;
 }
 
 state BreakLose
@@ -3347,9 +3783,12 @@ state GoShopping
     event BeginState(name PreviousStateName)
     {
         AbortMove();
-        KPawn.SetSprinting(true);
+        if (KPawn != none)
+        {
+            KPawn.SetSprinting(true);
+        }
         SetTimer(0.4000000 + (FRand() * 0.2500000), true);
-        //return;        
+        TraderRetryCount = 0;
     }
 
     event EndState(name NextStateName)
@@ -3372,28 +3811,39 @@ state GoShopping
 
     function PickStyle()
     {
-        // End:0x30
         if(KFGRI.OpenedTrader == none)
         {
             PickCombatStyle();
             return;
         }
-        // End:0x95
         if(ActorReachable(KFGRI.OpenedTrader))
         {
+            TraderRetryCount = 0;
             MoveToX(KFGRI.OpenedTrader.Location);
             return;
         }
-        // End:0xD8
         if(BuildPathToward(KFGRI.OpenedTrader))
         {
+            TraderRetryCount = 0;
             MoveTowardX(MoveTarget);            
         }
         else
         {
             AbortMove();
             SetTimer(0.0000000, false);
-            SetTimer(1.0000000 + (FRand() * 2.0000000), false, 'DoTrading');
+
+            // Trader Bodyblock mitigation (Loophole 6): bounded retry with
+            // backoff instead of cycling DoTrading forever against a blocked
+            // doorway.
+            ++TraderRetryCount;
+            if (TraderRetryCount >= TRADER_MAX_RETRIES)
+            {
+                TraderRetryCount = 0;
+                NextShoppingTime = WorldInfo.TimeSeconds + TRADER_GIVEUP_COOLDOWN;
+                PickCombatStyle();
+                return;
+            }
+            SetTimer((1.0000000 + (FRand() * 2.0000000)) + (float(TraderRetryCount) * 1.0000000), false, 'DoTrading');
         }
         //return;        
     }
@@ -3711,10 +4161,19 @@ state VictoryDance
     event BeginState(name PreviousStateName)
     {
         AbortMove();
-        // End:0x38
         if(Pawn != none)
         {
             Pawn.StopFiring();
+        }
+
+        // P1 Terminal Lock: derive the flag from the live match-over condition
+        // rather than from WHY VictoryDance was entered — a boss-kill dance or
+        // post-shopping taunt that happens to coincide with the match already
+        // being over still correctly locks in as terminal, while normal
+        // in-progress dances do not.
+        if (mut != none && mut.KF != none && mut.KF.MyKFGRI != none && mut.KF.MyKFGRI.bMatchIsOver)
+        {
+            bInTerminalState = true;
         }
         //return;        
     }

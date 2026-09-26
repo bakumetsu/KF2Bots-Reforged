@@ -825,6 +825,31 @@ function int GetFollowerIndex(KF2Bot Bot)
     return FollowerCount + 1;
 }
 
+// P7 Spotter: called by a group leader's SetEnemy() when it acquires a
+// target within SPOT_RADIUS_SQ. Pushes that target to followers who don't
+// already have a live Enemy of their own, rather than waiting for each
+// follower's independent FastTrace scan to catch up.
+function BroadcastSpottedEnemy(int GroupID, Pawn Spotted)
+{
+    local int GroupIdx, i;
+    local KF2Bot Member;
+
+    if (Spotted == None || !Spotted.IsAliveAndWell()) return;
+
+    GroupIdx = GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return;
+
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        Member = Fireteams[GroupIdx].Members[i];
+        if (Member == None || Member.bIsGroupLeader) continue;
+        if (Member.Pawn == None || Member.Pawn.Health <= 0) continue;
+        if (Member.Enemy != None && Member.Enemy.IsAliveAndWell()) continue; // already has a target
+
+        Member.SetEnemy(Spotted, true);
+    }
+}
+
 // Bot self-registration is handled in KF2Bot.PreBeginPlay() via mut.RegisterBot(self).
 // The actual bot spawning is done by final function bool AddBot() below.
 
