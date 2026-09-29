@@ -53,6 +53,29 @@ var float NextVictoryDance;
 var bool bNewWave;
 var bool bObjectiveActive;
 var transient bool bTraderListInit;
+// ============================================================
+// Promotion queue: tracks officer casualties for rank reassignment
+// ============================================================
+struct PromotionRequest
+{
+    var KF2Bot    DeadOfficer;
+    var KF2Bot    Replacement;
+    var EBotRank  OldRank;
+    var float     Score;
+};
+var array<PromotionRequest> PendingPromotions;
+
+// ============================================================
+// Human position cache: snapshots human pawns for pathfinding
+// ============================================================
+struct CachedHumanInfo
+{
+    var KFPawn_Human HumanPawn;
+    var vector Loc;
+    var vector Vel;
+};
+var array<CachedHumanInfo> CachedHumans;
+
 var transient bool bChatterInit;
 var config string _Separator4;
 var() config bool bBotsUnlimitedAmmo;
@@ -61,6 +84,7 @@ var config string _Separator5;
 var() config bool bNoZerkerBots;
 var() config bool bUseCustomBotNames;
 var() config bool bShowBotLevel;
+var() config bool bShowBotRole;
 var() config array<string> CustomBotNames;
 // Perk class names only (e.g. "KFPerk_Berserker"), NOT full paths - these
 // are resolved against the live PerkList at runtime (see ResolvePerkByName),
@@ -77,9 +101,20 @@ var() config float HealCylinderRadius;
 var() config float HealCylinderHeight;
 var() config float HealMinHealthPct;
 var() config bool bEnableFastTraceHealing;
+// ============================================================
+// Ranged medic dart: per-target 25s cooldown tracking
+// ============================================================
+var array<KFPawn_Human> RangedHealTargets;
+var array<float> RangedHealCooldownEnds;
 var transient array<string> AvailableBotNames;
 var transient array< Class<KFPerk> > PerkPool;
 var transient array<int> PerkPoolCounts;
+
+// Lightweight logging stub -- the mutator does not inherit KFAIController's
+// LogToProfiler, so this is a no-op placeholder for echelon diagnostics.
+function EchelonLog(string Msg)
+{
+}
 
 function PostBeginPlay()
 {
@@ -107,12 +142,14 @@ function PostBeginPlay()
         // First run (or config reset). The compiler skips config properties
         // listed in defaultproperties ("Import failed ... property is config"),
         // so their intended defaults are applied here instead.
-        NumBots = 6;
+        NumBots = 7;
         BotMaxPerkLv = 25;
         BotsDamageScale = 1.0;
         ZedCountScaling = 0.2;
+        bNoZerkerBots = true;
         bUseCustomBotNames = true;
         bShowBotLevel = false;
+        bShowBotRole = true;
         CustomBotNames.Length = 0;
         CustomBotNames.AddItem("Alex");
         CustomBotNames.AddItem("Reaper");
@@ -127,7 +164,7 @@ function PostBeginPlay()
         // typing them out by hand) means this can never drift out of sync
         // with the actual registered perks. Trim AllowedPerks in BotsMut.ini
         // to restrict which perks bots can draw.
-        MaxBotsPerPerk = 1;
+        MaxBotsPerPerk = 2;
         AllowedPerks.Length = 0;
         J = 0;
         while(J < Class'KFGame.KFPlayerController'.default.PerkList.Length)
@@ -141,7 +178,7 @@ function PostBeginPlay()
         // flip to false in BotsMut.ini once confirmed working.
         bDebugGrapple = false;
         MaxZedsForFailsafe = 3;
-        FailsafeActivationDelay = 8.0;
+        FailsafeActivationDelay = 3.0;
 
         // Dummy config strings with no code meaning of their own - purely
         // visual section dividers in BotsMut.ini, since SaveConfig() strips
@@ -172,6 +209,11 @@ function PostBeginPlay()
         ActiveChat = Spawn(Class'KF2Bots.KF2BotChat');
     }
     SetTimer(WAVE_POLL_INTERVAL, true, 'PollWaveStart');
+    
+    // Macro timers: RebuildHierarchy and CacheHumans run every 3.0 seconds
+    // RebuildHierarchy and CacheHumans run every 3.0 seconds.
+    SetTimer(3.0, true, 'RebuildHierarchy');
+    SetTimer(3.0, true, 'CacheHumans');
     //return;    
 }
 
@@ -264,6 +306,9 @@ function PollWaveStart()
     {
         LastPolledWaveNum = KFGRI.WaveNum;
         InitializePlatoon();
+        // Relocate bots to ammo-crate anchors (Bug 1 fix: overrides
+        // native player-start spawning from AddBot()).
+        RelocateBotsToAmmoCrates();
     }
 }
 
@@ -276,6 +321,24 @@ function InitializePlatoon()
     ShuffleActiveBots();
 
     if (ActiveBots.Length == 0) return;
+
+    // Clean dead/stale pointers from Fireteams[].Members (Bug 5 fix).
+    // PruneInvalidBots removes them from ActiveBots, but the Fireteams
+    // arrays retain the old references. Without this, new Grunts can be
+    // tethered to dead SLs, triggering the 10s PromotionGapTimer softlock.
+    for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
+    {
+        for (i = Fireteams[GroupIdx].Members.Length - 1; i >= 0; i--)
+        {
+            if (Fireteams[GroupIdx].Members[i] == None
+                || Fireteams[GroupIdx].Members[i].bDeleteMe
+                || Fireteams[GroupIdx].Members[i].Pawn == None
+                || Fireteams[GroupIdx].Members[i].Pawn.Health <= 0)
+            {
+                Fireteams[GroupIdx].Members.Remove(i, 1);
+            }
+        }
+    }
 
     GroupCount = DetermineGroupCount(ActiveBots.Length);
     NumGroups  = GroupCount;
@@ -300,12 +363,82 @@ function InitializePlatoon()
         {
             Fireteams[GroupIdx].Leader = Fireteams[GroupIdx].Members[0];
             Fireteams[GroupIdx].Leader.bIsGroupLeader = true;
+            // Assign SQUAD_LEADER rank to the fireteam leader
+            Fireteams[GroupIdx].Leader.BotRank = SQUAD_LEADER;
         }
+    }
+
+    // Assign GRUNT rank to all non-leader bots
+    // (E18 companion fix: skip group leaders. This pass previously reset EVERY bot,
+    //  including the SQUAD_LEADERs assigned above, back to GRUNT.)
+    for (i = 0; i < ActiveBots.Length; i++)
+    {
+        Bot = ActiveBots[i];
+        if (Bot == None) continue;
+        if (Bot.bIsGroupLeader) continue;
+        Bot.BotRank = GRUNT;
+    }
+    // Override VIP and Alpha commanders to their proper ranks
+    for (i = 0; i < ActiveBots.Length; i++)
+    {
+        Bot = ActiveBots[i];
+        if (Bot == None) continue;
+        if (Bot.bIsAlphaCommander)
+            Bot.BotRank = LIEUTENANT;
+        else if (Bot == VIPController)
+            Bot.BotRank = CAPTAIN;
+    }
+
+    SyncSquadLeaders();
+
+    // Initialize each bot's character (perks, arch, custom name) before
+    // refreshing name tags so the [Rank] Name format is correct.
+    for (i = 0; i < ActiveBots.Length; i++)
+    {
+        Bot = ActiveBots[i];
+        if (Bot == None) continue;
+        InitBotCharacter(Bot);
+        Bot.RefreshRoleNameTag();
     }
 
     UpdateMacroWaypoints();
     if (!IsTimerActive('UpdateMacroWaypoints'))
         SetTimer(MACRO_WAYPOINT_INTERVAL, true, 'UpdateMacroWaypoints');
+}
+
+// Single authority for every bot's SquadLeader pointer.
+// Driven by Fireteams[].Leader, so it is correct after EVERY leadership change
+// (called from InitializePlatoon and ConsolidateFireteams, i.e. after casualty,
+// demotion, reassignment and dissolve), not just at wave start.
+//   - Grunts   -> their fireteam's live leader.
+//   - The leader itself -> None (Bot code uses `SL = self` for the SL case; a
+//     self-pointer would make an SL run grunt-follow logic against itself).
+//   - Dead/stale leader -> None, so grunts take their existing
+//     LastValidSquadLeaderPos fallback instead of chasing a dead pawn.
+function SyncSquadLeaders()
+{
+    local int GroupIdx, i;
+    local KF2Bot Ldr, Member;
+
+    for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
+    {
+        Ldr = Fireteams[GroupIdx].Leader;
+        if (Ldr != None && (Ldr.bDeleteMe || Ldr.Pawn == None || Ldr.Pawn.Health <= 0))
+        {
+            Ldr = None;
+        }
+
+        for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+        {
+            Member = Fireteams[GroupIdx].Members[i];
+            if (Member == None) continue;
+
+            if (Member == Ldr)
+                Member.SquadLeader = None;
+            else
+                Member.SquadLeader = Ldr;
+        }
+    }
 }
 
 function ShuffleActiveBots()
@@ -355,6 +488,12 @@ function UpdateMacroWaypoints()
 
     PruneInvalidBots();
 
+    // Process the promotion queue each macro tick
+    ProcessPromotionQueue();
+
+    // Sweep expired ranged-heal cooldown entries each macro tick
+    CleanupRangedHealCooldowns();
+
     if (VIPController != None && (VIPController.Pawn == None || VIPController.Pawn.Health <= 0))
     {
         HandleVIPSuccession();
@@ -391,7 +530,15 @@ function UpdateMacroWaypoints()
         switch (GroupIdx)
         {
             case 0: 
-                if (VIP != None && VIP.Pawn != None)
+                // Obs 3 -- During trader rounds, Group 0 should roam freely
+                // rather than crowd the VIP. Clear the anchor so EvaluateLeaderMove
+                // falls through to roaming.
+                if (KFGRI != None && KFGRI.bTraderIsOpen)
+                {
+                    Fireteams[GroupIdx].Anchor = None;
+                    GroupLeader.AssignedAnchor = None;
+                }
+                else if (VIP != None && VIP.Pawn != None)
                 {
                     Fireteams[GroupIdx].Anchor = None;
                     GroupLeader.AssignedAnchor = VIP.Pawn;
@@ -526,7 +673,19 @@ function Pawn FindBossPawn()
 
 function OnBotKilled(KF2Bot DeadBot)
 {
+    local PromotionRequest Req;   // hoisted: locals must precede all statements
+
     if (DeadBot == None) return;
+
+    // If a dying bot was an officer, queue a promotion
+    if (DeadBot.BotRank == SQUAD_LEADER || DeadBot.BotRank == LIEUTENANT || DeadBot.BotRank == CAPTAIN)
+    {
+        Req.DeadOfficer = DeadBot;
+        Req.OldRank = DeadBot.BotRank;
+        Req.Replacement = None;
+        Req.Score = 0;
+        PendingPromotions.AddItem(Req);
+    }
 
     if (DeadBot == VIPController)
     {
@@ -576,6 +735,147 @@ function KF2Bot FindExpendableMember(array<KF2Bot> Candidates)
     return Worst;
 }
 
+// ============================================================
+// Promotion queue processing: reassign officer ranks after casualties
+// ============================================================
+
+// Process up to 2 promotions per macro-tick during active waves
+function ProcessPromotionQueue()
+{
+    local int i, MaxPerTick;
+    local int DeadGroupIdx;
+    local PromotionRequest Req;
+    local array<KF2Bot> Candidates;
+    local KFGameReplicationInfo KFGRI;
+
+    if (PendingPromotions.Length == 0) return;
+    KFGRI = KFGameReplicationInfo(WorldInfo.GRI);
+
+    MaxPerTick = 1;
+    if (KFGRI != None && KFGRI.WaveNum > 5)
+    {
+        MaxPerTick = 2;
+    }
+
+    // Build candidate list: all living grunts (not officers)
+    Candidates.Length = 0;
+    for (i = 0; i < ActiveBots.Length; i++)
+    {
+        if (ActiveBots[i] != None && ActiveBots[i].BotRank == GRUNT
+            && ActiveBots[i].Pawn != None && ActiveBots[i].Pawn.Health > 0)
+        {
+            Candidates.AddItem(ActiveBots[i]);
+        }
+    }
+
+    while (PendingPromotions.Length > 0 && MaxPerTick > 0)
+    {
+        Req = PendingPromotions[PendingPromotions.Length - 1];
+        PendingPromotions.Remove(PendingPromotions.Length - 1, 1);
+
+        // Promotion divergence fix:
+        // HandleFireteamCasualty already assigned a local SQUAD_LEADER with the
+        // correct rank. Skip global promotion for SQUAD_LEADER if the fireteam
+        // already has a live leader -- prevents double-promotion desync.
+        if (Req.OldRank == SQUAD_LEADER && Req.DeadOfficer != None)
+        {
+            DeadGroupIdx = Req.DeadOfficer.GroupID - 1;
+            if (DeadGroupIdx >= 0 && DeadGroupIdx < Fireteams.Length)
+            {
+                if (Fireteams[DeadGroupIdx].Leader != None
+                    && Fireteams[DeadGroupIdx].Leader.bIsGroupLeader
+                    && Fireteams[DeadGroupIdx].Leader.Pawn != None
+                    && Fireteams[DeadGroupIdx].Leader.Pawn.Health > 0)
+                {
+                    continue;   // local leader already in place, skip global promotion
+                }
+            }
+        }
+
+        if (Req.Replacement == None)
+        {
+            Req.Replacement = FindBestCandidate(Candidates);
+        }
+        if (Req.Replacement != None && Req.Replacement.Pawn != None && Req.Replacement.Pawn.Health > 0)
+        {
+            PromoteBot(Req.Replacement, Req.OldRank);
+            // Remove the promoted bot from candidates so it isn't re-picked
+            i = Candidates.Find(Req.Replacement);
+            if (i != INDEX_NONE)
+            {
+                Candidates.Remove(i, 1);
+            }
+            MaxPerTick = MaxPerTick - 1;
+        }
+    }
+}
+
+// Promote a bot to the given rank
+function PromoteBot(KF2Bot Bot, EBotRank NewRank)
+{
+    if (Bot == None) return;
+    Bot.BotRank = NewRank;
+}
+
+// ============================================================
+// Ranged medic dart: per-target 25s cooldown tracking
+// ============================================================
+function RegisterRangedHealTarget(KFPawn_Human Target)
+{
+    local int I;
+
+    if (Target == None) return;
+
+    I = 0;
+    while (I < RangedHealTargets.Length)
+    {
+        if (RangedHealTargets[I] == Target)
+        {
+            // Refresh the existing cooldown window
+            RangedHealCooldownEnds[I] = WorldInfo.TimeSeconds + 25.0;
+            return;
+        }
+        I++;
+    }
+    // New target -- add to the tracking array
+    RangedHealTargets.AddItem(Target);
+    RangedHealCooldownEnds.AddItem(WorldInfo.TimeSeconds + 25.0);
+}
+
+function bool IsRangedHealTargetOnCooldown(KFPawn_Human Target)
+{
+    local int I;
+
+    if (Target == None) return false;
+
+    I = 0;
+    while (I < RangedHealTargets.Length)
+    {
+        if (RangedHealTargets[I] == Target)
+        {
+            return WorldInfo.TimeSeconds < RangedHealCooldownEnds[I];
+        }
+        I++;
+    }
+    return false;
+}
+
+function CleanupRangedHealCooldowns()
+{
+    local int I;
+
+    I = RangedHealTargets.Length - 1;
+    while (I >= 0)
+    {
+        if (WorldInfo.TimeSeconds >= RangedHealCooldownEnds[I])
+        {
+            RangedHealTargets.Remove(I, 1);
+            RangedHealCooldownEnds.Remove(I, 1);
+        }
+        I--;
+    }
+}
+
 function HandleVIPSuccession()
 {
     local KF2Bot Best;
@@ -618,6 +918,7 @@ function HandleFireteamCasualty(KF2Bot DeadBot)
         if (NewLeader != None)
         {
             NewLeader.bIsGroupLeader = true;
+            NewLeader.BotRank = SQUAD_LEADER;
             NewLeader.ResetStuckState();
             Fireteams[GroupIdx].Leader = NewLeader;
         }
@@ -682,6 +983,7 @@ function ConsolidateFireteams()
             DissolveGroup(GroupIdx);
         }
     }
+    SyncSquadLeaders(); // re-point followers after any group change
 }
 
 function PullBotFromNearestGroup(int TargetGroupIdx)
@@ -1117,6 +1419,10 @@ final function InitBotCharacter(KF2Bot Bot)
     {
         BotName = ("[Lv" $ string(lvl) $ "] ") $ BotName;
     }
+    if(bShowBotRole)
+    {
+        BotName = ("[" $ Bot.GetRankName() $ "] ") $ BotName;
+    }
     if(PRI != none)
     {
         PRI.SetPlayerName(BotName);
@@ -1349,7 +1655,7 @@ final function RestartBot(KF2Bot NewPlayer, optional NavigationPoint StartSpot)
     // End:0x2DA
     if(NewPlayer.Pawn == none)
     {
-        LogInternal("failed to spawn player at " $ string(StartSpot));
+        EchelonLog("failed to spawn player at " $ string(StartSpot));
         NewPlayer.GotoState('Dead');        
     }
     else
@@ -1414,7 +1720,6 @@ static final function DebugMessage(string msg)
 {
     local PlayerController P;
 
-    LogInternal(msg, 'BotDebug');
     msg = "[BOT]" @ msg;
     // End:0xA5
     foreach Class'Engine.WorldInfo'.static.GetWorldInfo().AllControllers(Class'Engine.PlayerController', P)
@@ -1490,6 +1795,7 @@ function Mutate(string MutateString, PlayerController Sender)
             PMsg(Sender, ("-SetBotInfDosh <" $ string(bBotsUnlimitedCash)) $ "> = Bots have unlimited spending cash");
             PMsg(Sender, ("-SetUseCustomNames <" $ string(bUseCustomBotNames)) $ "> = Use CustomBotNames instead of look-based names");
             PMsg(Sender, ("-SetBotsLevel <" $ string(bShowBotLevel)) $ "> = Show [Lv X] prefix on bot names");
+            PMsg(Sender, ("-SetBotRole <" $ string(bShowBotRole)) $ "> = Show [Role] prefix on bot names");
         }
         else if(Left(MutateString, 11) ~= "SetNumBots ")
         {
@@ -1550,6 +1856,12 @@ function Mutate(string MutateString, PlayerController Sender)
             bShowBotLevel = bool(Mid(MutateString, 11));
             SaveConfig();
             PMsg(Sender, "Bots show [Lv X] name prefix: " $ string(bShowBotLevel));
+        }
+        else if(Left(MutateString, 13) ~= "SetBotRole ")
+        {
+            bShowBotRole = bool(Mid(MutateString, 13));
+            SaveConfig();
+            PMsg(Sender, "Bots show [Role] name prefix: " $ string(bShowBotRole));
         }
         else if(Left(MutateString, 18) ~= "SetBotDamageScale ")
         {
@@ -1645,6 +1957,260 @@ final function bool ShouldDoVictoryDance()
     return true;
     //return ReturnValue;    
 }
+
+// Macro timer: RebuildHierarchy and CacheHumans
+// Runs every 3.0 seconds. Rebuilds the echelon hierarchy and caches
+// human positions for pathfinding. Gated to avoid CPU frame spikes.
+function RebuildHierarchy()
+{
+    local int I;
+    local KF2Bot B;
+    
+    // Clear existing hierarchy links
+    for (I = 0; I < ActiveBots.Length; I++)
+    {
+        B = ActiveBots[I];
+        if (B == none) continue;
+        B.Subordinates.Length = 0;
+        B.Supervisor = none;
+    }
+    
+    // Rebuild: General -> Captains -> Grunts (round-robin)
+    // Full implementation will be added in a later batch.
+    EchelonLog("RebuildHierarchy: " $ ActiveBots.Length $ " bots");
+}
+
+function CacheHumans()
+{
+    // Delegate to the full human position cache
+    CacheHumanPositions();
+}
+// Helper stubs: utility functions for the echelon hierarchy
+// These stubs are required by Batch 2 snippets. Full implementations
+// will be added in subsequent batches as the echelon hierarchy matures.
+
+function KFPawn_Monster GetActiveBoss()
+{
+    // Stub: returns none until the AI Director integration is complete.
+    // Full implementation will query the KFAIDirector for the active boss.
+    return none;
+}
+
+// ============================================================
+// Immersion, Cohesion & Inter-Perk Polish
+// ============================================================
+
+// --- 6.3 Cache Human Positions (3.0s macro timer) ---
+function CacheHumanPositions()
+{
+    local KFPawn_Human H;
+    local CachedHumanInfo Info;
+
+    CachedHumans.Length = 0;
+    foreach WorldInfo.AllPawns(class'KFPawn_Human', H)
+    {
+        if (H.IsAliveAndWell() && PlayerController(H.Controller) != none)
+        {
+            Info.HumanPawn = H;
+            Info.Loc = H.Location;
+            Info.Vel = H.Velocity;
+            CachedHumans.AddItem(Info);
+        }
+    }
+}
+
+// --- 6.3 Get Objective Location ---
+function vector GetObjectiveLocation()
+{
+    if (bObjectiveActive && PrevObjective != none)
+    {
+        return PrevObjective.Location;
+    }
+    if (HoldVolume != none)
+    {
+        return HoldVolume.Location;
+    }
+    return vect(0,0,0);
+}
+
+// --- 6.5 Setup Squad Spawns ---
+function SetupSquadSpawns(int NumSquads)
+{
+    local int i, j, NumFactories, NumAssigned;
+    local array<KFPickupFactory> AmmoFactories;
+    local KFPickupFactory Temp;
+    local NavigationPoint PS;
+
+    if (NumSquads <= 0) return;
+
+    for (i = 0; i < KF.AllPickupFactories.Length; i++)
+    {
+        if (KFPickupFactory_Ammo(KF.AllPickupFactories[i]) != none)
+        {
+            AmmoFactories.AddItem(KF.AllPickupFactories[i]);
+        }
+    }
+    NumFactories = AmmoFactories.Length;
+    NumAssigned = Min(NumFactories, NumSquads);
+
+    // Partial Fisher-Yates: only the first NumAssigned slots are needed
+    for (i = 0; i < NumAssigned; i++)
+    {
+        j = i + Rand(NumFactories - i);
+        Temp = AmmoFactories[i];
+        AmmoFactories[i] = AmmoFactories[j];
+        AmmoFactories[j] = Temp;
+        SpawnSquadAt(AmmoFactories[i].Location, i);
+    }
+
+    // Fallback: maps with fewer crates than squads
+    for (i = NumAssigned; i < NumSquads; i++)
+    {
+        PS = KF.FindPlayerStart(none, 0);
+        if (PS != none)
+        {
+            SpawnSquadAt(PS.Location, i);
+        }
+        else if (NumAssigned > 0)
+        {
+            SpawnSquadAt(AmmoFactories[0].Location, i);
+        }
+    }
+
+    HideAllPickups();
+}
+
+// Relocate existing bots to ammo-crate anchor positions (Bug 1 fix).
+// Called from PollWaveStart() after InitializePlatoon(). Unlike
+// SetupSquadSpawns() which spawns NEW bots, this teleports the
+// already-spawned ActiveBots to shuffled ammo-crate positions so the
+// native AddBot() player-start spawn is overridden.
+function RelocateBotsToAmmoCrates()
+{
+    local int i, j, NumFactories, GroupIdx;
+    local array<KFPickupFactory> AmmoFactories;
+    local KFPickupFactory Temp;
+    local KF2Bot Bot;
+    local vector AnchorPos;
+
+    if (ActiveBots.Length == 0) return;
+
+    // Gather ammo-crate factories
+    AmmoFactories.Length = 0;
+    for (i = 0; i < KF.AllPickupFactories.Length; i++)
+    {
+        if (KFPickupFactory_Ammo(KF.AllPickupFactories[i]) != none)
+        {
+            AmmoFactories.AddItem(KF.AllPickupFactories[i]);
+        }
+    }
+    NumFactories = AmmoFactories.Length;
+    if (NumFactories == 0) return;
+
+    // Shuffle factories (Fisher-Yates)
+    for (i = 0; i < NumFactories; i++)
+    {
+        j = i + Rand(NumFactories - i);
+        Temp = AmmoFactories[i];
+        AmmoFactories[i] = AmmoFactories[j];
+        AmmoFactories[j] = Temp;
+    }
+
+    // Assign one anchor per fireteam, teleport members to the anchor
+    for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
+    {
+        if (GroupIdx >= NumFactories) break;
+        AnchorPos = AmmoFactories[GroupIdx].Location;
+
+        for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+        {
+            Bot = Fireteams[GroupIdx].Members[i];
+            if (Bot == None || Bot.Pawn == None) continue;
+            // Obs 2 -- Only teleport freshly-spawned bots, not already-active ones.
+            if (!Bot.bJustSpawned) continue;
+
+            // Relocate the bot to a point near the anchor
+            if (Bot.bIsGroupLeader)
+            {
+                Bot.Pawn.SetLocation(AnchorPos);
+            }
+            else
+            {
+                // Grunts offset 90-150u from the anchor
+                Bot.Pawn.SetLocation(PickSquadSpawnPoint(AnchorPos, 90.0, 150.0));
+            }
+        }
+    }
+}
+
+// --- 6.5 Spawn Squad At Anchor ---
+function SpawnSquadAt(vector AnchorPos, int SquadIndex)
+{
+    local int i;
+    local vector GruntPos;
+
+    // Spawn SL nearest the anchor ring (60-90u)
+    SpawnBotWithRank(SQUAD_LEADER, PickSquadSpawnPoint(AnchorPos, 60.0, 90.0));
+
+    // Spawn 3 grunts 90-150u from anchor
+    for (i = 0; i < 3; i++)
+    {
+        GruntPos = PickSquadSpawnPoint(AnchorPos, 90.0, 150.0);
+        SpawnBotWithRank(GRUNT, GruntPos);
+    }
+}
+
+// --- 6.5 Pick Squad Spawn Point ---
+function vector PickSquadSpawnPoint(vector AnchorPos, float MinR, float MaxR)
+{
+    local float R, Ang;
+    local vector P;
+
+    R = MinR + FRand() * (MaxR - MinR);
+    Ang = FRand() * 360.0;
+    P = AnchorPos;
+    P.X += Cos(Ang * 0.0174533) * R;
+    P.Y += Sin(Ang * 0.0174533) * R;
+    return P;
+}
+
+// --- 6.5 Spawn Bot With Rank ---
+function KF2Bot SpawnBotWithRank(EBotRank Rank, vector SpawnPos)
+{
+    local KF2Bot B;
+
+    B = Spawn(class'KF2Bot', Self,, SpawnPos, rot(0,0,0));
+    if (B != none)
+    {
+        B.BotRank = Rank;
+        RegisterBot(B);
+    }
+    return B;
+}
+
+// --- 6.5 Hide All Pickups (10s delay) ---
+function HideAllPickups()
+{
+    local int i;
+
+    for (i = 0; i < KF.AllPickupFactories.Length; i++)
+    {
+        KF.AllPickupFactories[i].bPickupHidden = true;
+    }
+    SetTimer(10.0, false, 'ReEnableAmmoFactories');
+}
+
+function ReEnableAmmoFactories()
+{
+    local int i;
+
+    for (i = 0; i < KF.AllPickupFactories.Length; i++)
+    {
+        KF.AllPickupFactories[i].bPickupHidden = false;
+    }
+}
+
+// ============================================================
 
 defaultproperties
 {
