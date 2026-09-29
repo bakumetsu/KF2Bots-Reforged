@@ -159,6 +159,10 @@ var float LastTriageTime;
 // HealPacingEnd: 30s behavioral pacing (bypassed by emergency < 50%)
 var float SyringeRechargeEnd;
 var float HealPacingEnd;
+var float HealRetryAfter;
+var int FailStreak;
+var float landingDeadline;
+var float equipDeadline;
 
 // Obs 2 -- Random spawn gate: only freshly-spawned bots are teleported to
 // ammo-crate positions. Cleared once the bot enters its first combat state.
@@ -508,7 +512,7 @@ function Restart(bool bVehicleTransition)
     }
     KFPRI = KFPlayerReplicationInfo(PlayerReplicationInfo);
     Pawn.bModifyReachSpecCost = false;
-    Pawn.PathSearchType = 0;
+    Pawn.PathSearchType = 1; // PST_Constraint: forces nav-mesh-constrained paths (no impossible vertical jumps)
     GotoState('Roaming');
     // End:0x60D
     if(KPawn != none)
@@ -1959,6 +1963,13 @@ final function bool CheckShouldHealMate()
         return false;
     }
 
+    // Failure backoff: a failed heal stamps HealRetryAfter; the gate
+    // rejects until the backoff elapses, preventing a livelock loop.
+    if (WorldInfo.TimeSeconds < HealRetryAfter)
+    {
+        return false;
+    }
+
     // Obs 1 / Obs 10: close-range syringe healing (HealOther) is highly
     // ineffective during active combat and caused the combat lockup. It is
     // only permitted during trader rounds; during combat the bot relies on
@@ -2064,6 +2075,13 @@ final function bool CheckMedicGunHeal()
         return false;
     }
 
+    // Failure backoff: a failed heal stamps HealRetryAfter; the gate
+    // rejects until the backoff elapses, preventing a livelock loop.
+    if (WorldInfo.TimeSeconds < HealRetryAfter)
+    {
+        return false;
+    }
+
     RangeMedicGun = KFWeap_MedicBase(Pawn.Weapon);
     if(RangeMedicGun == none)
     {
@@ -2140,6 +2158,13 @@ final function bool CheckShouldSelfHeal()
         return false;
     }
 
+    // Failure backoff: a failed heal stamps HealRetryAfter; the gate
+    // rejects until the backoff elapses, preventing a livelock loop.
+    if (WorldInfo.TimeSeconds < HealRetryAfter)
+    {
+        return false;
+    }
+
     // Primary threshold: bots attempt self-heal at 80% or below.
     if (KPawn.Health >= (HEAL_MAX_NEED_PCT / 100.0) * KPawn.HealthMax)
     {
@@ -2169,7 +2194,7 @@ final function bool CheckShouldSelfHeal()
     MedicGun = none;
     foreach KFInvManager.InventoryActors(Class'KFGame.KFWeap_HealerBase', W)
     {
-        if(W.HasAmmo(1))
+        if(W.HasAmmo(0))
         {
             MedicGun = W;
             break;
@@ -2436,6 +2461,54 @@ function PromotionGapTimer()
 }
 
 // Heal-animation-hang failsafe -- never cleared during the animation
+// Echelon Healing: shared affordability predicate. Gate AND state must
+// agree on the same ammo threshold to prevent the 1-99 silent-skip livelock.
+function bool CanAffordHeal(int Type)
+{
+    if (Type == 0)
+    {
+        return (MedicGun != none) && (MedicGun.AmmoCount[0] >= 100.0);
+    }
+    return (RangeMedicGun != none) && (RangeMedicGun.AmmoCount[1] >= 50.0);
+}
+
+// Echelon Healing: every non-success exit routes through here. Stamps a
+// bounded backoff so a failing heal cannot livelock the priority chain.
+function HealFail()
+{
+    FailStreak++;
+    HealRetryAfter = WorldInfo.TimeSeconds + FMin(4.0 * FailStreak, 20.0);
+    PendingHeal = none;
+}
+
+// Echelon Healing: the ONLY place 15s/30s pacing stamps are written.
+// A failed heal never stamps pacing — it uses HealFail()'s backoff instead.
+function HealSuccess()
+{
+    FailStreak = 0;
+    SyringeRechargeEnd = WorldInfo.TimeSeconds + 15.0;
+    HealPacingEnd = WorldInfo.TimeSeconds + 30.0;
+}
+
+// Echelon Healing: global safety net. Replaces the dead HealTimeOut timer.
+// Fires 1.5s after any heal-state exit; if the bot is still holding a
+// healer in a non-heal state, force-switch to the best combat weapon.
+function VerifyWeapon()
+{
+    if (Pawn == none)
+    {
+        return;
+    }
+    if (GetStateName() == 'HealingSelf' || GetStateName() == 'HealOther' || GetStateName() == 'HealRanged')
+    {
+        return;
+    }
+    if(KFWeap_HealerBase(Pawn.Weapon) != none)
+    {
+        Pawn.InvManager.SwitchToBestWeapon(true);
+    }
+}
+
 function HealTimeOut()
 {
     PickCombatStyle();
@@ -2862,12 +2935,11 @@ state PickNextMove
         // sequential branch here. Per Design Doc aSec2.3.
 
         // Priority 3: Critical Survival -- Health < 80% HealthMax.
+        // Pacing stamps (15s/30s) are set in HealSuccess() on the state's
+        // happy path, not here. A failed heal uses HealFail()'s bounded
+        // backoff instead, preventing a livelock without a 30s dead zone.
         if (KPawn != none && CheckShouldSelfHeal())
         {
-            // Dual-timer: arm both the 15s mechanical recharge and the
-            // 30s behavioral pacing gate from the moment healing begins.
-            SyringeRechargeEnd = WorldInfo.TimeSeconds + 15.0;
-            HealPacingEnd = WorldInfo.TimeSeconds + 30.0;
             GotoState('HealingSelf');
             return;
         }
@@ -4195,98 +4267,93 @@ state HealingSelf
 
     event EndState(name NextStateName)
     {
-        ClearTimer('TimeOut');
-        ClearTimer('HealTimeOut');
         ClearTimer('HealFailsafe');
+        ClearTimer('VerifyWeapon');
+        PendingHeal = none;
         if(Pawn != none)
         {
             Pawn.StopFiring();
+            // Weapon restore on EVERY exit path (timeout, order, death,
+            // enemy-sight). The 1.5s VerifyWeapon one-shot is a backstop
+            // for any exit path that missed the switch.
+            if(KFWeap_HealerBase(Pawn.Weapon) != none)
+            {
+                Pawn.InvManager.SwitchToBestWeapon(true);
+            }
+            SetTimer(1.5, false, 'VerifyWeapon');
         }
     }
 
     function TimeOut()
     {
+        HealFail();
         PickCombatStyle();
     }
 
     function HealFailsafe()
     {
-        // 8-second failsafe: if no successful heal has occurred, force-exit to combat
-        if(Pawn != none && Pawn.InvManager != none)
-        {
-            Pawn.InvManager.SwitchToBestWeapon(true);
-        }
+        // 8-second failsafe: force-exit to combat if heal never completes
+        HealFail();
         PickCombatStyle();
     }
 Begin:
-
-    if(Pawn.Physics == 2)
+    // Bounded landing check (WaitForLanding has no timeout in KF2 SDK)
+    if(Pawn.Physics == PHYS_Walking)
     {
-        WaitForLanding();
+        landingDeadline = WorldInfo.TimeSeconds + 2.0;
+        while(Pawn.Physics == PHYS_Walking && WorldInfo.TimeSeconds < landingDeadline)
+        {
+            Sleep(0.1);
+        }
     }
-    SetTimer(5.0000000, false, 'TimeOut');
-    SetTimer(8.0000000, false, 'HealFailsafe');
+    SetTimer(8.0, false, 'HealFailsafe');
 
     if((KPawn == none) || KPawn.Health <= 0)
     {
-        ClearTimer('TimeOut');
-        ClearTimer('HealFailsafe');
+        HealFail();
         PickCombatStyle();
         stop;
     }
 
-    // Step 1: equip the syringe
-    while((MedicGun != none) && Pawn.Weapon != MedicGun)
+    // Shared predicate: gate and state must agree on ammo threshold
+    if(!CanAffordHeal(0))
+    {
+        HealFail();
+        PickCombatStyle();
+        stop;
+    }
+
+    // Equip syringe (bounded: 3s max, re-request every 0.1s)
+    equipDeadline = WorldInfo.TimeSeconds + 3.0;
+    while(Pawn.Weapon != MedicGun && WorldInfo.TimeSeconds < equipDeadline)
     {
         Pawn.InvManager.SetCurrentWeapon(MedicGun);
-        Sleep(0.1000000);
+        Sleep(0.1);
     }
-    if(MedicGun == none)
+    if(Pawn.Weapon != MedicGun)
     {
-        ClearTimer('TimeOut');
-        ClearTimer('HealFailsafe');
+        HealFail();
         PickCombatStyle();
         stop;
     }
-    if(KPawn.Health <= 0)
-    {
-        ClearTimer('TimeOut');
-        ClearTimer('HealFailsafe');
-        PickCombatStyle();
-        stop;
-    }
-    ClearTimer('TimeOut');
-    ClearTimer('HealFailsafe');
 
     Focus = Pawn;
 
-    // Step 2: apply self-heal
-    if(MedicGun.AmmoCount[0] >= 100)
+    // Apply self-heal
+    MedicGun.AmmoCount[0] -= 100;
+    MedicGun.PerformReload();
+    MedicGun.PlayAnimation('Heal_Self');
+    KPawn.HealthToRegen += 20;
+    Sleep(FMin(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Self'), 0.1), 3.0));
+
+    if(KPawn.Health + KPawn.HealthToRegen > KPawn.HealthMax)
     {
-        MedicGun.AmmoCount[0] -= 100;
-        MedicGun.PerformReload();
-        MedicGun.PlayAnimation('Heal_Self');
-        SetTimer(5.0000000, false, 'HealTimeOut');
-        KPawn.HealthToRegen += 20;
-        Sleep(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Self'), 0.1000000));
-
-        // Step 3: native triggers, on KPawn (not PendingHeal)
-        if(KPawn.Health + KPawn.HealthToRegen > KPawn.HealthMax)
-        {
-            KPawn.HealthToRegen = KPawn.HealthMax - KPawn.Health;
-        }
-        KPawn.SetTimer(KPawn.HealthRegenRate, true, 'GiveHealthOverTime');
-        KPawn.PlayHeal(class'KFDT_Healing');
+        KPawn.HealthToRegen = KPawn.HealthMax - KPawn.Health;
     }
+    KPawn.SetTimer(KPawn.HealthRegenRate, true, 'GiveHealthOverTime');
+    KPawn.PlayHeal(class'KFDT_Healing');
 
-    // Bug 5 fix: switch back to the best weapon before exiting the heal state.
-    // Without this, the bot remains holding the syringe and can't fight.
-    if(Pawn != none && Pawn.InvManager != none)
-    {
-        Pawn.InvManager.SwitchToBestWeapon(true);
-    }
-
-    // Step 4
+    HealSuccess();
     PickCombatStyle();
     stop;
 }
@@ -4301,106 +4368,109 @@ state HealOther
 
     event EndState(name NextStateName)
     {
-        ClearTimer('TimeOut');
-        ClearTimer('HealTimeOut');
         ClearTimer('HealFailsafe');
+        ClearTimer('VerifyWeapon');
+        PendingHeal = none;
         if(Pawn != none)
         {
             Pawn.StopFiring();
+            if(KFWeap_HealerBase(Pawn.Weapon) != none)
+            {
+                Pawn.InvManager.SwitchToBestWeapon(true);
+            }
+            SetTimer(1.5, false, 'VerifyWeapon');
         }
     }
 
     function TimeOut()
     {
-        PendingHeal = none;
+        HealFail();
         PickCombatStyle();
     }
 
     function HealFailsafe()
     {
         // 8-second failsafe: force-exit to combat if heal never completes
-        PendingHeal = none;
-        if(Pawn != none && Pawn.InvManager != none)
-        {
-            Pawn.InvManager.SwitchToBestWeapon(true);
-        }
+        HealFail();
         PickCombatStyle();
     }
 Begin:
-
-    if(Pawn.Physics == 2)
+    // Bounded landing check (WaitForLanding has no timeout in KF2 SDK)
+    if(Pawn.Physics == PHYS_Walking)
     {
-        WaitForLanding();
+        landingDeadline = WorldInfo.TimeSeconds + 2.0;
+        while(Pawn.Physics == PHYS_Walking && WorldInfo.TimeSeconds < landingDeadline)
+        {
+            Sleep(0.1);
+        }
     }
-    SetTimer(5.0000000, false, 'TimeOut');
-    SetTimer(8.0000000, false, 'HealFailsafe');
+    SetTimer(8.0, false, 'HealFailsafe');
 
-    while((MedicGun != none) && Pawn.Weapon != MedicGun)
+    if(PendingHeal == none)
     {
-        Pawn.InvManager.SetCurrentWeapon(MedicGun);
-        Sleep(0.1000000);
-    }
-    if(MedicGun == none)
-    {
-        ClearTimer('TimeOut');
-        ClearTimer('HealFailsafe');
-        PendingHeal = none;
+        HealFail();
         PickCombatStyle();
         stop;
     }
 
+    // APPROACH FIRST (bot walks with combat weapon, not the syringe)
     while(true)
     {
-        // Obs 10: stop once the target reaches 60% (no over-healing; conserves
-        // syringe ammo). Re-evaluates on the next triage cycle if it drops again.
         if((PendingHeal == none) || !PendingHeal.IsAliveAndWell() || PendingHeal.Health >= (HEAL_MIN_NEED_PCT / 100.0) * PendingHeal.HealthMax)
         {
-            ClearTimer('TimeOut');
-            ClearTimer('HealFailsafe');
-            PendingHeal = none;
+            HealFail();
             PickCombatStyle();
             stop;
         }
-        if((VSize(PendingHeal.Location - Pawn.Location) <= 200.0000000) && LineOfSightTo(PendingHeal))
+        if((VSize(PendingHeal.Location - Pawn.Location) <= 200.0) && LineOfSightTo(PendingHeal))
         {
             break;
         }
         MoveTowardX(PendingHeal);
-        Sleep(0.1000000);
+        Sleep(0.1);
     }
-    ClearTimer('TimeOut');
-    ClearTimer('HealFailsafe');
+
+    // EQUIP LAST (bounded: 3s max)
+    if(!CanAffordHeal(0))
+    {
+        HealFail();
+        PickCombatStyle();
+        stop;
+    }
+    equipDeadline = WorldInfo.TimeSeconds + 3.0;
+    while(Pawn.Weapon != MedicGun && WorldInfo.TimeSeconds < equipDeadline)
+    {
+        Pawn.InvManager.SetCurrentWeapon(MedicGun);
+        Sleep(0.1);
+    }
+    if(Pawn.Weapon != MedicGun)
+    {
+        HealFail();
+        PickCombatStyle();
+        stop;
+    }
 
     AbortMove();
-    Pawn.Acceleration = vect(0.0000000, 0.0000000, 0.0000000);
+    Pawn.Acceleration = vect(0, 0, 0);
     Focus = PendingHeal;
     Target = PendingHeal;
     FinishRotation();
 
-    if(MedicGun.AmmoCount[0] >= 100)
+    // APPLY heal
+    MedicGun.AmmoCount[0] -= 100;
+    MedicGun.PerformReload();
+    MedicGun.PlayAnimation('Heal_Team');
+    PendingHeal.HealthToRegen += 20;
+    Sleep(FMin(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Team'), 0.1), 3.0));
+
+    if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
     {
-        MedicGun.AmmoCount[0] -= 100;
-        MedicGun.PerformReload();
-        MedicGun.PlayAnimation('Heal_Team');
-        SetTimer(5.0000000, false, 'HealTimeOut');
-        PendingHeal.HealthToRegen += 20;
-        Sleep(FMax(MedicGun.MySkelMesh.GetAnimInterruptTime('Heal_Team'), 0.1000000));
-
-        if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
-        {
-            PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
-        }
-        PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
-        PendingHeal.PlayHeal(class'KFDT_Healing');
+        PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
     }
+    PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
+    PendingHeal.PlayHeal(class'KFDT_Healing');
 
-    // Bug 5 fix: switch back to the best weapon before exiting the heal state.
-    if(Pawn != none && Pawn.InvManager != none)
-    {
-        Pawn.InvManager.SwitchToBestWeapon(true);
-    }
-
-    PendingHeal = none;
+    HealSuccess();
     PickCombatStyle();
     stop;
 }
@@ -4416,104 +4486,113 @@ state HealRanged
 
     event EndState(name NextStateName)
     {
-        ClearTimer('TimeOut');
-        ClearTimer('HealTimeOut');
         ClearTimer('HealFailsafe');
+        ClearTimer('VerifyWeapon');
+        PendingHeal = none;
         if(Pawn != none)
         {
             Pawn.StopFiring();
+            if(KFWeap_MedicBase(Pawn.Weapon) != none)
+            {
+                Pawn.InvManager.SwitchToBestWeapon(true);
+            }
+            SetTimer(1.5, false, 'VerifyWeapon');
         }
     }
 
     function TimeOut()
     {
-        PendingHeal = none;
+        HealFail();
         PickCombatStyle();
     }
 
     function HealFailsafe()
     {
-        PendingHeal = none;
-        if(Pawn != none && Pawn.InvManager != none)
-        {
-            Pawn.InvManager.SwitchToBestWeapon(true);
-        }
+        // 8-second failsafe: force-exit to combat if heal never completes
+        HealFail();
         PickCombatStyle();
     }
 Begin:
-
-    if(Pawn.Physics == 2)
+    // Bounded landing check (WaitForLanding has no timeout in KF2 SDK)
+    if(Pawn.Physics == PHYS_Walking)
     {
-        WaitForLanding();
+        landingDeadline = WorldInfo.TimeSeconds + 2.0;
+        while(Pawn.Physics == PHYS_Walking && WorldInfo.TimeSeconds < landingDeadline)
+        {
+            Sleep(0.1);
+        }
     }
-    SetTimer(5.0000000, false, 'TimeOut');
-    SetTimer(8.0000000, false, 'HealFailsafe');
+    SetTimer(8.0, false, 'HealFailsafe');
 
-    while((RangeMedicGun != none) && Pawn.Weapon != RangeMedicGun)
+    if(PendingHeal == none)
     {
-        Pawn.InvManager.SetCurrentWeapon(RangeMedicGun);
-        Sleep(0.1000000);
-    }
-    if(RangeMedicGun == none)
-    {
-        ClearTimer('TimeOut');
-        ClearTimer('HealFailsafe');
-        PendingHeal = none;
+        HealFail();
         PickCombatStyle();
         stop;
     }
 
+    // APPROACH FIRST (bot walks with combat weapon, not the medic gun)
     while(true)
     {
-        // Obs 10: stop once the target reaches 60% (no over-healing; conserves
-        // dart ammo). Re-evaluates on the next triage cycle if it drops again.
         if((PendingHeal == none) || !PendingHeal.IsAliveAndWell() || PendingHeal.Health >= (HEAL_MIN_NEED_PCT / 100.0) * PendingHeal.HealthMax)
         {
-            ClearTimer('TimeOut');
-            ClearTimer('HealFailsafe');
-            PendingHeal = none;
+            HealFail();
             PickCombatStyle();
             stop;
         }
-        if((VSize(PendingHeal.Location - Pawn.Location) <= 1500.0000000) && LineOfSightTo(PendingHeal))
+        if((VSize(PendingHeal.Location - Pawn.Location) <= 1500.0) && LineOfSightTo(PendingHeal))
         {
             break;
         }
         MoveTowardX(PendingHeal);
-        Sleep(0.1000000);
+        Sleep(0.1);
     }
-    ClearTimer('TimeOut');
-    ClearTimer('HealFailsafe');
+
+    // EQUIP LAST (bounded: 3s max)
+    if(!CanAffordHeal(1))
+    {
+        HealFail();
+        PickCombatStyle();
+        stop;
+    }
+    equipDeadline = WorldInfo.TimeSeconds + 3.0;
+    while(Pawn.Weapon != RangeMedicGun && WorldInfo.TimeSeconds < equipDeadline)
+    {
+        Pawn.InvManager.SetCurrentWeapon(RangeMedicGun);
+        Sleep(0.1);
+    }
+    if(Pawn.Weapon != RangeMedicGun)
+    {
+        HealFail();
+        PickCombatStyle();
+        stop;
+    }
 
     AbortMove();
-    Pawn.Acceleration = vect(0.0000000, 0.0000000, 0.0000000);
+    Pawn.Acceleration = vect(0, 0, 0);
     Focus = PendingHeal;
     Target = PendingHeal;
     FinishRotation();
 
-    if(RangeMedicGun.AmmoCount[1] >= 50)
+    // APPLY dart
+    RangeMedicGun.AmmoCount[1] -= 50;
+    RangeMedicGun.StartHealRecharge();
+    RangeMedicGun.PlayAnimation('Shoot_Dart');
+    if(mut != none)
     {
-        RangeMedicGun.AmmoCount[1] -= 50;
-        RangeMedicGun.StartHealRecharge();
-        RangeMedicGun.PlayAnimation('Shoot_Dart');
-        SetTimer(5.0000000, false, 'HealTimeOut');
-        // Register this target's 25s cooldown so the squad distributes darts
-        if(mut != none)
-        {
-            mut.RegisterRangedHealTarget(PendingHeal);
-        }
-        PendingHeal.HealthToRegen += RangeMedicGun.default.HealAmount;
-        Sleep(RangeMedicGun.GetFireInterval(1));
-
-        if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
-        {
-            PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
-        }
-        PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
-        PendingHeal.PlayHeal(class'KFDT_Healing');
+        mut.RegisterRangedHealTarget(PendingHeal);
     }
+    PendingHeal.HealthToRegen += RangeMedicGun.default.HealAmount;
+    Sleep(FMin(RangeMedicGun.GetFireInterval(1), 3.0));
 
-    PendingHeal = none;
+    if(PendingHeal.Health + PendingHeal.HealthToRegen > PendingHeal.HealthMax)
+    {
+        PendingHeal.HealthToRegen = PendingHeal.HealthMax - PendingHeal.Health;
+    }
+    PendingHeal.SetTimer(PendingHeal.HealthRegenRate, true, 'GiveHealthOverTime');
+    PendingHeal.PlayHeal(class'KFDT_Healing');
+
+    HealSuccess();
     PickCombatStyle();
     stop;
 }
