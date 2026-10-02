@@ -418,6 +418,7 @@ function InitializePlatoon()
 function SyncSquadLeaders()
 {
     local int GroupIdx, i;
+    local int FollowerSlot, FollowerTotal;
     local KF2Bot Ldr, Member;
 
     for (GroupIdx = 0; GroupIdx < Fireteams.Length; GroupIdx++)
@@ -428,15 +429,35 @@ function SyncSquadLeaders()
             Ldr = None;
         }
 
+        // HCA roster hook (pass 1): count the followers so each gets a stable
+        // 0-based follow slot. The slot drives the watchdog time-slice and
+        // the arrival ring in KF2BotsFollowNavBase (FollowSlotPhase / ring step).
+        FollowerTotal = 0;
+        for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+        {
+            Member = Fireteams[GroupIdx].Members[i];
+            if (Member != None && Member != Ldr)
+            {
+                FollowerTotal++;
+            }
+        }
+
+        FollowerSlot = 0;
         for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
         {
             Member = Fireteams[GroupIdx].Members[i];
             if (Member == None) continue;
 
             if (Member == Ldr)
+            {
                 Member.SquadLeader = None;
+            }
             else
+            {
                 Member.SquadLeader = Ldr;
+                Member.FollowSetSlot(FollowerSlot, FollowerTotal);
+                FollowerSlot++;
+            }
         }
     }
 }

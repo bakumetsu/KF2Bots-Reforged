@@ -1,4 +1,4 @@
-class KF2Bot extends AIController
+class KF2Bot extends KF2BotsFollowNavBase
     hidecategories(Navigation);
 
 struct FRouteDoorBlockade
@@ -66,6 +66,12 @@ const RETREAT_ZED_TRIGGER_COUNT     = 4;
 const RETREAT_ZED_CLEAR_COUNT       = 2;
 const RETREAT_HEAVY_RADIUS          = 300.0;
 const FOLLOWER_DRIFT_SQ             = 250000.0;   // 500u
+const OBJ_BAIL_COOLDOWN             = 8.0;        // finding #3: unreachable-objective retry cooldown (s)
+const FOLLOW_ESCAPE_COOLDOWN        = 1.5;        // follow-combat-escape debounce (s)
+const HUNT_ZED_THRESHOLD            = 15;        // low-zed hunting trigger
+const HUNT_SCAN_RADIUS              = 5000.0;    // active nearest-zed scan radius (units)
+const GLOBAL_ZED_RADIUS             = 8000.0;    // approximate full-map zed scan
+const GLOBAL_ZED_COUNT_INTERVAL     = 3.0;       // seconds between global zed scans
 
 const TRIAGE_INTERVAL               = 2.0;        // P6
 const VIP_TRIAGE_GATE_PCT           = 50.0;
@@ -92,6 +98,15 @@ const SIREN_CHECK_RADIUS            = 1200.0;
 
 const TRADER_MAX_RETRIES            = 3;          // P9
 const TRADER_GIVEUP_COOLDOWN        = 10.0;
+
+// Trader round roam/reform: while the trader is open the squad tether is
+// dropped and each bot roams within TRADER_ROAM_RADIUS (units) of the trader;
+// the final TRADER_REFORM_REMAINING seconds re-engage the tether so the squad
+// re-forms before the trader closes.
+const TRADER_ROAM_RADIUS = 3000.0;
+const TRADER_ROAM_RADIUS_SQ = 9000000.0;
+const TRADER_REFORM_REMAINING = 5.0;
+
 var transient byte CallStack;
 var byte MoveFlags;
 var byte HealingStage;
@@ -118,6 +133,7 @@ var transient float SerpentineTime;
 var transient float NextGrenadeTimer;
 var transient float EnemyEncounterTime;
 var transient float NextShoppingTime;
+var transient float ObjectiveBailUntil;
 var transient float NextAdjustTime;
 var transient float MovePauseTime;
 var transient float TempBlockTime;
@@ -146,6 +162,13 @@ var bool  bIsRetreating;
 var float LastZedCountTime;
 var int   CachedZedCount;
 var bool  bCachedHeavyZed;
+
+// Follow-combat-escape debounce
+var float LastFollowEscapeTime;
+
+// Global zed count (low-zed hunting trigger)
+var int   GlobalZedCount;
+var float LastGlobalZedCountTime;
 
 // P8 EvaluateFollowerMove -- Retreat Paradox hold-position
 var bool   bHasHoldPosition;
@@ -261,6 +284,9 @@ var float BlockedShooterWindowStart;
 var float LineSuppressUntil;
 var transient KFWeapon RangeCacheWeapon;
 var transient float RangeCacheSq;
+var float ShotgunEffectiveRangeUU;
+var float FlamethrowerEffectiveRangeUU;
+var float DefaultWeaponEffectiveRangeUU;
 var transient float NextReloadAttempt;
 var transient float NextWeaponSwitchTime;
 var transient float NextFallbackPoll;
@@ -480,7 +506,13 @@ function Restart(bool bVehicleTransition)
         Pawn.InvManager.SetupFor(Pawn);
     }
     super(Controller).Restart(bVehicleTransition);
-    // Arm staggered rank timers after restart (rank already assigned by Mutator)
+    // Reset rank to GRUNT on respawn: the Hub re-assigns the correct rank
+    // via SyncSquadLeaders() on the next macro-tick. Without this, a bot
+    // promoted to SQUAD_LEADER before death respawns as a leader, creating
+    // duplicate leaders in the same fireteam (5-leader bug).
+    BotRank = GRUNT;
+    bIsGroupLeader = false;
+    // Arm staggered rank timers after restart
     ArmRankTimers();
     // Reset weapon fallback state
     bFallbackWeapon = false;
@@ -513,6 +545,7 @@ function Restart(bool bVehicleTransition)
     KFPRI = KFPlayerReplicationInfo(PlayerReplicationInfo);
     Pawn.bModifyReachSpecCost = false;
     Pawn.PathSearchType = 1; // PST_Constraint: forces nav-mesh-constrained paths (no impossible vertical jumps)
+    ValidateAndNudgeSpawn();
     GotoState('Roaming');
     // End:0x60D
     if(KPawn != none)
@@ -573,6 +606,13 @@ function SeeMonster(Pawn Seen)
 event bool NotifyBump(Actor Other, Vector HitNormal)
 {
     local Vector Dir;
+
+    // Follower mode: the base's handler owns friendly-bump reaction, so
+    // skip the legacy door / adjust body below to avoid a double reaction.
+    if (FollowOwnsEvents() && FollowHandleBump(Other, HitNormal))
+    {
+        return true;
+    }
 
     // Chain to the base class first: some Controller.NotifyBump
     // implementations disable the bump probe, so re-arm it here to keep
@@ -1192,14 +1232,92 @@ final function CheckBlockedPath(Actor Start, NavigationPoint End)
     //return;    
 }
 
+// HCA wiring: hub-side reaction to follower-nav status changes. The base
+// calls this synchronously from inside its state function, so we do NOT
+// GotoState here -- that would make UE3 resume the old state function after
+// the next latent. Instead we set bFollowExitPending; the base checks the
+// flag in its Dispatch label and performs the GotoState + return there.
+function FollowNotifyHub(EFollowStatus NewStatus)
+{
+    switch (NewStatus)
+    {
+        case FS_Arrived:
+            // Base holds position in its slot ring (FA_Hold); Hub just records.
+            `log("[FollowNav] KF2Bot: FS_Arrived -- holding slot " $ string(FollowSlotIndex) $ "/" $ string(FollowSlotCount));
+            break;
+
+        case FS_LeaderTeleported:
+            // Route invalidated; the base decorrelates and repaths on its own.
+            `log("[FollowNav] KF2Bot: FS_LeaderTeleported -- route invalid, decorrelated");
+            break;
+
+        case FS_LeaderLost:
+        case FS_Blocked:
+            // Never freeze: hand control back to the decision hub. The base
+            // exits to FollowExitState on its next dispatch and the P8
+            // tether hook re-decides (regroup, or anchor fallback if the
+            // leader is gone).
+            `log("[FollowNav] KF2Bot: " $ string(int(NewStatus)) @ "-- returning to PickNextMove");
+            FollowExitState = 'PickNextMove';
+            bFollowExitPending = true;
+            break;
+    }
+}
+
+// Retry ladder exhausted before the hub takes over: log and let the
+// deferred FS_Blocked return re-decide. The SDK's terminal-stuck "suicide"
+// is deliberately not replicated here.
+function FollowOnGaveUp()
+{
+    `log("[FollowNav] KF2Bot: follow retry ladder exhausted; hub will re-decide via PickNextMove");
+}
+
 function Tick(float Delta)
 {
+    // WARNING: never call Super.Tick(Delta) here. KFAIController.Tick
+    // (SDK line 3934) evaluates stuck-possibility and its terminal
+    // "suicide" recovery kills the bot - if this class is ever re-parented
+    // under KFAIController, that path would fire for follower bots.
     // End:0x11
     if(Pawn == none)
     {
         return;
     }
     
+    // Follow-combat escape (HCA wiring): the follower state is nav-only and
+    // SetEnemy() never transitions state, so a Zed with LOS while tethered
+    // would go unfought. Route to P7 combat exactly as PickNextMove would.
+    // The base's Dispatch stale-resume guard stops the old state function
+    // from dispatching stale follow code after this transition.
+    if (IsInState('FollowingLeader') || IsInState('FollowingLeaderBasic'))
+    {
+        if (Enemy != none && Enemy.IsAliveAndWell()
+            && !(KFPawn_Monster(Enemy) != none && KFPawn_Monster(Enemy).bIsHeadless)
+            && (WorldInfo.TimeSeconds - LastFollowEscapeTime >= FOLLOW_ESCAPE_COOLDOWN))
+        {
+            LastFollowEscapeTime = WorldInfo.TimeSeconds;
+            if (LineOfSightTo(Enemy))
+            {
+                `log("[FollowNav]" @ string(Name) @ "Tick escape -> FightEnemy " $ string(Enemy));
+                GotoState('FightEnemy');
+            }
+            else
+            {
+                `log("[FollowNav]" @ string(Name) @ "Tick escape -> Hunting " $ string(Enemy));
+                GotoState('Hunting');
+            }
+            return;
+        }
+    }
+    
+    // Global zed count refresh (throttled): feeds the low-zed hunting trigger
+    // in PickNextMove. 8000u radius approximates the full KF2 map.
+    if (WorldInfo.TimeSeconds - LastGlobalZedCountTime >= GLOBAL_ZED_COUNT_INTERVAL)
+    {
+        LastGlobalZedCountTime = WorldInfo.TimeSeconds;
+        GlobalZedCount = CountNearbyZeds(GLOBAL_ZED_RADIUS);
+    }
+
     // Grunt movement must run every frame: the restricted-tick gate that
     // early-exited here blocked the MoveFlags execution block below, leaving
     // Grunts frozen (the "limbo" state) until a Zed set bEngageActive.
@@ -1583,6 +1701,14 @@ final function bool NeedToTurn(Vector targ)
 
 event bool NotifyHitWall(Vector HitNormal, Actor Wall)
 {
+    // Follower mode: the base's handler owns wall reaction (per-wall hit
+    // counter + stuck ladder), so skip the legacy door / wall-adjust body
+    // below to avoid a double reaction.
+    if (FollowOwnsEvents())
+    {
+        return FollowHandleHitWall(HitNormal, Wall);
+    }
+
     // Chain to the base class before our door / wall-adjust handling so the
     // legacy wall-bump behaviour is preserved.
     super.NotifyHitWall(HitNormal, Wall);
@@ -2180,8 +2306,9 @@ final function bool CheckShouldSelfHeal()
     }
 
     // Behavioral Pacing Timer (30s): prevents constant weapon-unequip for
-    // minor chip damage. Bypassed in emergency (health < 50%).
-    if (WorldInfo.TimeSeconds < HealPacingEnd)
+    // minor chip damage. Bypassed in emergency (health < 50%) and while the
+    // trader is open (trader rounds: let the bot fully top up on health).
+    if (WorldInfo.TimeSeconds < HealPacingEnd && !(KFGRI != None && KFGRI.bTraderIsOpen))
     {
         // Emergency override: if health drops below 50%, bypass the pacing
         // gate since the mechanical recharge is already complete.
@@ -2487,7 +2614,9 @@ function HealSuccess()
 {
     FailStreak = 0;
     SyringeRechargeEnd = WorldInfo.TimeSeconds + 15.0;
-    HealPacingEnd = WorldInfo.TimeSeconds + 30.0;
+    // Behavioral pacing randomized to 20-30s so the 15s syringe lockout
+    // and the pacing gate desync across bots instead of running in lockstep.
+    HealPacingEnd = WorldInfo.TimeSeconds + (20.0 + FRand() * 10.0);
 }
 
 // Echelon Healing: global safety net. Replaces the dead HealTimeOut timer.
@@ -2597,6 +2726,44 @@ function ProcessOverwatchPhase()
         EchelonLog("Overwatch phase toggled: " $ (bOverwatchPhase ? "HOLD" : "ADVANCE"));
     }
 }
+// AUDIT 2nd-priority(b): break the follower limbo. A bot sitting in
+// FollowingLeader never re-evaluates P5 (objective) or P9 (trader) because
+// PickCombatStyle early-returns while in a follower state. This override runs
+// from the base's FollowWatchdog each pass; when a higher-priority goal
+// appears it sets FollowExitState + bFollowExitPending and the base's Dispatch
+// GotoStates out of the follower state to that goal.
+function bool FollowCheckExit()
+{
+    local int IterDistSq;
+
+    if (KFGRI != none
+        && KFGRI.bTraderIsOpen
+        && KFGRI.OpenedTrader != none
+        && NextShoppingTime < WorldInfo.TimeSeconds)
+    {
+        FollowExitState = 'GoShopping';
+        bFollowExitPending = true;
+        EchelonLog("FollowCheckExit -> GoShopping (slot=" $ string(FollowSlotIndex) $ ")");
+        return true;
+    }
+
+    if (mut != none
+        && mut.bObjectiveActive
+        && ObjectiveGoal != none)
+    {
+        IterDistSq = VSizeSq(ObjectiveGoal.Location - Pawn.Location);
+        if (IterDistSq > SYG_DISTANCE_SQ
+            && WorldInfo.TimeSeconds >= ObjectiveBailUntil)
+        {
+            FollowExitState = 'DoObjective';
+            bFollowExitPending = true;
+            EchelonLog("FollowCheckExit -> DoObjective (slot=" $ string(FollowSlotIndex) $ ")");
+            return true;
+        }
+    }
+    return false;
+}
+
 function PickCombatStyle()
 {
     // Obs 2 -- Clear the spawn flag once the bot enters its first combat
@@ -2611,6 +2778,20 @@ function PickCombatStyle()
     if (bInTerminalState)
     {
         GotoState('VictoryDance');
+        return;
+    }
+
+    // HCA wiring (crash fix): the follower-nav states own their own
+    // re-evaluation (watchdog + Dispatch). Every re-eval funnel here
+    // (FinishedMove/Timer/EnemyChanged) was yanking bots back to
+    // PickNextMove, and the P8 tether hook re-issued FollowStart on
+    // every entry -- an infinite FollowingLeader<->PickNextMove flap
+    // that hammered the native pathfinder and crashed the game.
+    // Combat escape is handled in Tick(); the hub exit flag (FS_LeaderLost/
+    // FS_Blocked) is handled by the base's Dispatch, not here.
+    if (bEnableAdvancedLocomotion
+        && (IsInState('FollowingLeader') || IsInState('FollowingLeaderBasic')))
+    {
         return;
     }
     GotoState('PickNextMove');
@@ -2829,6 +3010,7 @@ simulated event ReplicatedEvent(name VarName)
 function FinishObjective()
 {
     ObjectiveGoal = none;
+    ObjectiveBailUntil = 0.0;
     //return;    
 }
 
@@ -2962,13 +3144,15 @@ state PickNextMove
             if (ObjectiveGoal == none)
             {
                 ObjectiveGoal = mut.GetBotObjective(self);
-            }
-            if (ObjectiveGoal != none && VSizeSq(ObjectiveGoal.Location - Pawn.Location) > SYG_DISTANCE_SQ)
-            {
-                GotoState('DoObjective');
-                return;
-            }
-        }
+                        ObjectiveBailUntil = 0.0;
+                    }
+                    if (ObjectiveGoal != none && VSizeSq(ObjectiveGoal.Location - Pawn.Location) > SYG_DISTANCE_SQ
+                        && WorldInfo.TimeSeconds >= ObjectiveBailUntil)
+                    {
+                        GotoState('DoObjective');
+                        return;
+                    }
+                }
 
         // Priority 6: Squad Medic (Triage) -- 2.0s throttle shared by both the
         // dart (ranged) and syringe (melee-range) triage scans.
@@ -3012,6 +3196,15 @@ state PickNextMove
         // Priority 8: Squad Tethering
         if (EvaluateSquadTether()) return;
 
+        // Priority 8.5: Low zed count → force hunting.
+        // When few zeds remain map-wide, don't let bots camp or tether
+        // passively — actively hunt the last stragglers.
+        if (Enemy == none && GlobalZedCount > 0 && GlobalZedCount < HUNT_ZED_THRESHOLD)
+        {
+            GotoState('Hunting');
+            return;
+        }
+
         // Priority 9: Economy -- only reachable once SYG (P5) is satisfied.
         if (KFGRI.bTraderIsOpen && NextShoppingTime < WorldInfo.TimeSeconds && KFGRI.OpenedTrader != none)
         {
@@ -3031,12 +3224,24 @@ Begin:
 
 function bool EvaluateSquadTether()
 {
+    local vector TDiff;
+
     if (Pawn == None || mut == None) return false;
-    // Trader bypass: if the trader is open and shopping is due,
-    // skip tethering so the bot falls through to P9 (Economy).
+    // Trader window: while the trader is open and more than
+    // TRADER_REFORM_REMAINING seconds remain, drop the squad tether and let
+    // each bot roam within TRADER_ROAM_RADIUS of the trader. Bots that drift
+    // beyond the band path back to the trader. In the final seconds the
+    // tether re-engages below (squad re-formation).
     if (KFGRI != None && KFGRI.bTraderIsOpen && KFGRI.OpenedTrader != None
-        && NextShoppingTime < WorldInfo.TimeSeconds)
+        && KFGRI.GetTraderTimeRemaining() > TRADER_REFORM_REMAINING)
     {
+        TDiff = Pawn.Location - KFGRI.OpenedTrader.Location;
+        if (TDiff.X * TDiff.X + TDiff.Y * TDiff.Y + TDiff.Z * TDiff.Z > TRADER_ROAM_RADIUS_SQ)
+        {
+            // Drifted beyond the roam band: head back to the trader.
+            MoveTowardGoal(KFGRI.OpenedTrader, vect(0, 0, 0), true);
+            return true;
+        }
         return false;
     }
     if (!IsAnchorValid(AssignedAnchor)) return false;
@@ -3051,6 +3256,36 @@ function bool IsAnchorValid(Actor Anchor)
     AnchorPawn = Pawn(Anchor);
     if (AnchorPawn != None && AnchorPawn.Health <= 0) return false;
     return true;
+}
+
+// Post-respawn spawn validation: in rare edge cases (e.g., Steam Fortress
+// random-spawn glitch) a bot can spawn embedded in a wall with no valid
+// floor. If the spawn is not on a walkable floor, nudge the pawn
+// horizontally in a bounded loop until it lands on one.
+function ValidateAndNudgeSpawn()
+{
+    local vector NudgeLoc;
+    local int Attempts;
+
+    if (Pawn == None) return;
+    if (IsOnWalkableFloor()) return;
+    `log("[FollowNav] ValidateAndNudgeSpawn: spawn not on a floor, nudging");
+    for (Attempts = 0; Attempts < 6; Attempts++)
+    {
+        NudgeLoc = Pawn.Location;
+        NudgeLoc.X = NudgeLoc.X + (FRand() * 128.0 - 64.0);
+        NudgeLoc.Y = NudgeLoc.Y + (FRand() * 128.0 - 64.0);
+        SetLocation(NudgeLoc);
+        if (IsOnWalkableFloor()) return;
+    }
+    `log("[FollowNav] ValidateAndNudgeSpawn: nudged, still settling");
+}
+
+function bool IsOnWalkableFloor()
+{
+    if (Pawn == None || Pawn.Base == None || Pawn.Base == Pawn) return false;
+    if (Pawn.Location.Z < Pawn.Base.Location.Z) return false;
+    return (Pawn.Location.Z - Pawn.Base.Location.Z) < 80.0;
 }
 
 function bool EvaluateLeaderMove()
@@ -3099,6 +3334,18 @@ function bool EvaluateFollowerMove()
     if (Leader.bIsStuck)
     {
         return MoveTowardGoal(AssignedAnchor, vect(0,0,0), true);
+    }
+
+    // HCA follower activation hook (Plan B): hand tethering to the follower
+    // nav base. FollowStart is void (FollowSetLeader + GotoState); the
+    // follower state then owns the slot ring, hysteresis, A* budget and the
+    // staggered repath. Leader is already null-checked above. Flag OFF
+    // falls through to the legacy formation-offset path below.
+    if (bEnableAdvancedLocomotion)
+    {
+        FollowStart(Leader);
+        `log("[FollowNav] KF2Bot: FollowStart issued; leaderGroup=" $ string(Leader.GroupID) $ " slot=" $ string(FollowSlotIndex) $ "/" $ string(FollowSlotCount));
+        return true;
     }
 
     FormationGoal = ComputeFormationOffset(Leader, Leader.bSingleFileFormation);
@@ -3472,6 +3719,10 @@ state DoObjective extends Roaming
 
     function PickStyle()
     {
+        local bool IterGoalReachable;
+
+        IterGoalReachable = false;
+
         // P5 SYG Death March fix (Loophole 7): assess the approach corridor
         // for hazards before committing to another leg of the path.
         if (CheckObjectiveHazard())
@@ -3482,6 +3733,7 @@ state DoObjective extends Roaming
         if(ObjectiveGoal == none)
         {
             ObjectiveGoal = mut.GetBotObjective(self);
+            ObjectiveBailUntil = 0.0;
         }
 
         // GC Null-Check: ObjectiveGoal can still be None here (objective
@@ -3497,11 +3749,13 @@ state DoObjective extends Roaming
         {
             if(ActorReachable(ObjectiveGoal))
             {
+                IterGoalReachable = true;
                 MoveTowardX(ObjectiveGoal);
                 return;
             }
             if(BuildPathToward(ObjectiveGoal))
             {
+                IterGoalReachable = true;
                 MoveTowardX(MoveTarget);
                 return;
             }            
@@ -3510,6 +3764,24 @@ state DoObjective extends Roaming
         {
             Focus = none;
             SetFocalPoint(Pawn.Location + (VRand() * 1000.0000000));
+            return;
+        }
+        // AUDIT finding #3: goal is far but BOTH reachable checks failed ->
+        // the objective is geometrically unreachable (locked door / other
+        // floor). Bail out to combat instead of death-marching on
+        // BuildRandomPath; P5 + FollowCheckExit skip DoObjective during the
+        // cooldown, so the bot follows the leader and re-evaluates after.
+        if (!IterGoalReachable
+            && VSizeSq(ObjectiveGoal.Location - Pawn.Location) > 90000.0000000)
+        {
+            if (WorldInfo.TimeSeconds < ObjectiveBailUntil)
+            {
+                PickCombatStyle();
+                return;
+            }
+            ObjectiveBailUntil = WorldInfo.TimeSeconds + OBJ_BAIL_COOLDOWN;
+            EchelonLog("DoObjective: objective unreachable, bailing to combat (slot=" $ string(FollowSlotIndex) $ ")");
+            PickCombatStyle();
             return;
         }
         if((RandGoal == none) && !BuildRandomPath())
@@ -3570,6 +3842,24 @@ state FightEnemy
         }
         if(!Enemy.IsAliveAndWell() && !PickNextEnemy())
         {
+            if(Pawn != none)
+            {
+                Pawn.StopFiring();
+            }
+            Enemy = none;
+            AbortMove();
+            CheckWeaponReequip();
+            FinishedMove();
+            return;
+        }
+        // A zed with its head blown off dies within seconds; stop wasting
+        // ammo on it and acquire a live target instead.
+        if((Enemy != none) && (KFPawn_Monster(Enemy) != none) && KFPawn_Monster(Enemy).bIsHeadless)
+        {
+            if(Pawn != none)
+            {
+                Pawn.StopFiring();
+            }
             Enemy = none;
             AbortMove();
             CheckWeaponReequip();
@@ -4238,12 +4528,45 @@ state Hunting
 
     function Timer()
     {
-        // End:0x52
-        if(((Enemy == none) || !Enemy.IsAliveAndWell()) || LineOfSightTo(Enemy))
+        // Actively hunt: scan for the nearest live, visible zed and chase it
+        // rather than only reacting when a zed gets close.
+        local KFPawn_Monster BestZed;
+        local float BestDist;
+        BestZed = None;
+        BestDist = 999999.0;
+        foreach WorldInfo.AllPawns(class'KFPawn_Monster', BestZed, Pawn.Location, HUNT_SCAN_RADIUS)
+        {
+            if (!BestZed.IsAliveAndWell())
+            {
+                continue;
+            }
+            if (BestZed.GetTeamNum() == GetTeamNum())
+            {
+                continue;
+            }
+            if (!FastTrace(BestZed.Location, Pawn.Location))
+            {
+                continue;
+            }
+            if (VSizeSq(BestZed.Location - Pawn.Location) < BestDist)
+            {
+                BestDist = VSizeSq(BestZed.Location - Pawn.Location);
+            }
+        }
+        if (BestZed != None)
+        {
+            SetEnemy(BestZed);
+            BuildPathToward(Enemy);
+            MoveTowardX(MoveTarget, Enemy);
+        }
+        else if ((Enemy == none) || !Enemy.IsAliveAndWell())
         {
             PickCombatStyle();
         }
-        //return;        
+        else if (LineOfSightTo(Enemy))
+        {
+            PickCombatStyle();
+        }
     }
 Begin:
 
@@ -5849,11 +6172,30 @@ final function bool ShouldReload(KFWeapon W)
 }
 
 // Weapon range efficiency gate -- EffectiveRange lives on KFWeaponDefinition,
-// which is not directly reachable from a KFWeapon instance. Use a fixed
-// 50 m (5000 UU) default that covers most firearms in the KF2 arsenal.
+// which is not directly reachable from a KFWeapon instance. Firearms keep a
+// wide default; close-range weapons (shotguns, flamethrowers) get a short
+// gate so they close distance instead of firing from afar.
 final function float GetWeaponEffectiveRangeUU(KFWeapon W)
 {
-	return 5000.0;
+	if(W == none)
+	{
+		return DefaultWeaponEffectiveRangeUU;
+	}
+	if(W.IsA('KFWeap_ShotgunBase'))
+	{
+		return ShotgunEffectiveRangeUU;
+	}
+	if(W.IsA('KFWeap_Flame_Flamethrower'))
+	{
+		return FlamethrowerEffectiveRangeUU;
+	}
+	// ShrinkRayGun, FreezeThrower, and any future FlameBase children
+	// share the close-range gate; Flamethrower is matched above first.
+	if(W.IsA('KFWeap_FlameBase'))
+	{
+		return FlamethrowerEffectiveRangeUU;
+	}
+	return DefaultWeaponEffectiveRangeUU;
 }
 
 final function bool IsInEffectiveRange(Actor T)
@@ -7168,4 +7510,8 @@ defaultproperties
 	// Batch 6: Panic defaults
 	PanicVarianceMultiplier=1.0
 	PanicScanSpeedMultiplier=1.0
+	// Close-weapon effective range gates (UU)
+	ShotgunEffectiveRangeUU=1100.0
+	FlamethrowerEffectiveRangeUU=700.0
+	DefaultWeaponEffectiveRangeUU=5000.0
 }
