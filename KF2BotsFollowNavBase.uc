@@ -83,6 +83,11 @@ var float FollowSlotRingStep;               // keep >= 2 * collision radius + ma
 var float FollowResumeMargin;               // hysteresis: leave Hold only beyond radius + margin
 var float FollowZTolerance;
 var bool  bFollowArrived;
+// AUDIT_3B Step 5: order-ring anchor (model b). Active only while the
+// squad order is Enroute/Holding AND this bot has a claimed slot; the
+// leader's live position governs in every other state (leader ring).
+var bool   bFollowOrderAnchorActive;
+var vector FollowOrderAnchorLoc;
 
 //-----------------------------------------------------------------------------
 // TIME SLICING
@@ -219,6 +224,15 @@ function FollowSetSlot(int NewSlotIndex, int NewSlotCount)
 {
     FollowSlotIndex = Max(NewSlotIndex, 0);
     FollowSlotCount = Max(NewSlotCount, 1);
+}
+
+// AUDIT_3B Step 5: order-ring anchor hook. Base default = no anchor
+// (leader ring untouched); KF2Bot overrides with the hub's SquadOrder
+// data (Enroute/Holding + claimed slot position).
+function bool FollowGetOrderAnchor(out vector OutLoc)
+{
+    OutLoc = vect(0, 0, 0);
+    return false;
 }
 
 function FollowResetEpisode()
@@ -521,6 +535,7 @@ function bool FollowEvalArrived()
     local float  IterDz;
     local float  IterRadius;
     local bool   IterWasArrived;
+    local vector IterAnchorRef;
 
     if (Pawn == None || FollowLeaderPawn == None)
     {
@@ -529,7 +544,18 @@ function bool FollowEvalArrived()
     }
 
     IterWasArrived = bFollowArrived;
-    IterDelta = FollowLeaderPawn.Location - Pawn.Location;
+    // AUDIT_3B Step 5: arrival is measured against the claimed slot
+    // position (GoalPoint-anchored order ring) when the anchor is active,
+    // else against the leader's live position (existing FollowNav ring).
+    if (bFollowOrderAnchorActive)
+    {
+        IterAnchorRef = FollowOrderAnchorLoc;
+    }
+    else
+    {
+        IterAnchorRef = FollowLeaderPawn.Location;
+    }
+    IterDelta = IterAnchorRef - Pawn.Location;
     IterDz = Abs(IterDelta.Z);
     IterDelta.Z = 0.0;
     IterDist = VSize(IterDelta);
@@ -702,6 +728,7 @@ function EFollowAction FollowDecide()
 {
     local float IterNow;
     local bool  IterUsePath;
+    local vector IterAnchor;
 
     IterNow = WorldInfo.TimeSeconds;
     FollowWaitTime = FollowWatchdogPeriod;
@@ -715,6 +742,16 @@ function EFollowAction FollowDecide()
     {
         FollowWaitTime = 0.5;
         return FA_Wait;
+    }
+    // AUDIT_3B Step 5: refresh the order-ring anchor for this pass.
+    if (FollowGetOrderAnchor(IterAnchor))
+    {
+        bFollowOrderAnchorActive = true;
+        FollowOrderAnchorLoc = IterAnchor;
+    }
+    else
+    {
+        bFollowOrderAnchorActive = false;
     }
     if (FollowRetries >= FollowRetriesGiveUpAt)
     {
@@ -1319,8 +1356,17 @@ DirectMove:
     // can GotoState at any frame; cancelling a native MoveToward mover mid-
     // flight is the suspected native-fatal trigger. Arrive via FollowDecide.
     FollowOnMoveBegin(true);
-    `log("[FollowNav]" @ string(Name) @ "Accel leader " $ string(FollowLeaderPawn) @ " radius=" $ string(FollowGetArrivalRadius()));
-    Pawn.Acceleration = Normal(FollowLeaderPawn.Location - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+    if (bFollowOrderAnchorActive)
+    {
+        // AUDIT_3B Step 5: drive toward the claimed slot (GoalPoint-
+        // anchored order ring) instead of the leader.
+        Pawn.Acceleration = Normal(FollowOrderAnchorLoc - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+    }
+    else
+    {
+        `log("[FollowNav]" @ string(Name) @ "Accel leader " $ string(FollowLeaderPawn) @ " radius=" $ string(FollowGetArrivalRadius()));
+        Pawn.Acceleration = Normal(FollowLeaderPawn.Location - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+    }
     Sleep(FollowMinLoopSleep);
     Goto('Dispatch');
 
@@ -1380,6 +1426,8 @@ GiveUpStep:
 //=============================================================================
 state FollowingLeaderBasic
 {
+    local vector IterAnchor;
+
 Begin:
     // Same stale-resume + hub-exit guards as the advanced state
     // ('Stop', not 'return' -- UScript 2.2 state functions).
@@ -1409,9 +1457,26 @@ Begin:
         Sleep(0.3);
         Goto('Begin');
     }
+    // AUDIT_3B Step 5: refresh the order-ring anchor for this pass.
+    if (FollowGetOrderAnchor(IterAnchor))
+    {
+        bFollowOrderAnchorActive = true;
+        FollowOrderAnchorLoc = IterAnchor;
+    }
+    else
+    {
+        bFollowOrderAnchorActive = false;
+    }
     if (ActorReachable(FollowLeaderPawn))
     {
-        Pawn.Acceleration = Normal(FollowLeaderPawn.Location - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+        if (bFollowOrderAnchorActive)
+        {
+            Pawn.Acceleration = Normal(FollowOrderAnchorLoc - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+        }
+        else
+        {
+            Pawn.Acceleration = Normal(FollowLeaderPawn.Location - Pawn.Location) * FMax(Pawn.GroundSpeed, 0.0001f);
+        }
     }
     else
     {

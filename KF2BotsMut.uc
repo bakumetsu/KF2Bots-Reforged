@@ -11,6 +11,33 @@ struct FireteamData
     var NavigationPoint Anchor;
 };
 
+// AUDIT_3B Step 3: per-bot failed-node record (owner + expiry). MUST precede
+// SquadOrder, which holds array<NavNodeBlock>.
+struct NavNodeBlock
+{
+    var name     Node;
+    var KF2Bot   Owner;
+    var float    ExpiresAt;
+};
+
+// AUDIT_3B Step 3: one shared squad objective work-order, owned by the
+// mutator and stored in parallel with Fireteams (index == group index).
+struct SquadOrder
+{
+    var int                       SquadID;
+    var KF2Bot                    Leader;
+    var KFMapObjective_DoshHold   Zone;
+    var vector                    GoalPoint;
+    var NavigationPoint           GoalNav;
+    var array<int>                Slots;
+    var int                       Phase;
+    var float                     StartTime;
+    var float                     ObjectiveBailUntil;
+    var array<NavNodeBlock>       NodeBlacklist;
+    var array<vector>             SlotLocs;
+    var float                     SquadSeedAngle;
+};
+
 var transient array<AIWeaponInfo> TraderList;
 var config int ConfigVer;
 var config string _Separator1;
@@ -26,6 +53,7 @@ var() config float ZedCountScaling;
 var KF2BotChat ActiveChat;
 var array<KF2Bot>       ActiveBots;
 var array<FireteamData> Fireteams;
+var array<SquadOrder>   SquadOrders;
 var int                 NumGroups;
 
 var Controller VIPController;
@@ -43,6 +71,19 @@ const REARGUARD_OFFSET          = 2000.0;
 const CHOKEPOINT_LATERAL_OFFSET = 1000.0;
 const NAV_SEARCH_RADIUS         = 1500.0;
 const MACRO_WAYPOINT_INTERVAL   = 3.0;
+// AUDIT_3B Step 3/4b: squad-order phase codes + node-blacklist expiry.
+const OBJ_BAIL_COOLDOWN         = 8.0;
+const PHASE_IDLE                = 0;
+const PHASE_ENROUTE             = 1;
+const PHASE_HOLDING             = 2;
+const PHASE_REGROUP             = 3;
+const PHASE_SHOPPING            = 4;
+// AUDIT_3B Step 7: regroup timing (doc s2.4: 5s window, 6s hard timeout).
+const REGROUP_DURATION          = 5.0;
+const REGROUP_HARD_TIMEOUT      = 6.0;
+// Mirrors KF2Bots.KF2Bot::HUNT_SCAN_RADIUS (5000u) for the idle-leader
+// "no zeds in scan radius" entry test.
+const REGROUP_SCAN_RADIUS       = 5000.0;
 const WAVE_POLL_INTERVAL        = 1.0;
 var KFGameInfo_Survival KF;
 var Actor PrevObjective;
@@ -75,6 +116,8 @@ struct CachedHumanInfo
     var vector Vel;
 };
 var array<CachedHumanInfo> CachedHumans;
+// AUDIT_3B Step 7: per-squad idle-leader stamp (0.0 = not currently idle).
+var array<float> SquadIdleStamp;
 
 var transient bool bChatterInit;
 var config string _Separator4;
@@ -110,10 +153,18 @@ var transient array<string> AvailableBotNames;
 var transient array< Class<KFPerk> > PerkPool;
 var transient array<int> PerkPoolCounts;
 
-// Lightweight logging stub -- the mutator does not inherit KFAIController's
-// LogToProfiler, so this is a no-op placeholder for echelon diagnostics.
+var float LastAuditLogTime;
+// AUDIT_3B Stage 3: real hub-side audit line. ORDER_* lines are rate-limited
+// to one per 5s (per-bot bot-side lines are limited separately in KF2Bot).
 function EchelonLog(string Msg)
 {
+    if (WorldInfo == None) return;
+    if (Msg ~= "ORDER_*")
+    {
+        if (WorldInfo.TimeSeconds - LastAuditLogTime < 5.0) return;
+        LastAuditLogTime = WorldInfo.TimeSeconds;
+    }
+    `log("[KF2BotsAudit] [Mut] " $ Msg);
 }
 
 function PostBeginPlay()
@@ -285,6 +336,8 @@ function RegisterBot(KF2Bot NewBot)
     if (NewBot == None) return;
     if (ActiveBots.Find(NewBot) == INDEX_NONE) ActiveBots.AddItem(NewBot);
     NewBot.mut = self;
+    // Hub contact stamp: registration is a real hub<->bot contact.
+    NewBot.WdLastHubContactTime = WorldInfo.TimeSeconds;
 }
 
 function UnregisterBot(KF2Bot LeavingBot)
@@ -521,6 +574,9 @@ function UpdateMacroWaypoints()
     }
 
     if (ActiveBots.Length == 0 || NumGroups <= 0) return;
+
+    // AUDIT_3B Step 7: regroup entry evaluation (leader death / idle leader).
+    EvaluateRegroupEntries();
 
     KFGRI = KFGameReplicationInfo(WorldInfo.GRI);
 
@@ -942,13 +998,21 @@ function HandleFireteamCasualty(KF2Bot DeadBot)
             NewLeader.BotRank = SQUAD_LEADER;
             NewLeader.ResetStuckState();
             Fireteams[GroupIdx].Leader = NewLeader;
+            InheritSquadOrder(GroupIdx, NewLeader);
         }
         else
         {
             Fireteams[GroupIdx].Leader = None;
+            if (GroupIdx < SquadOrders.Length)
+            {
+                SquadOrders[GroupIdx].Leader = None;
+                SquadOrders[GroupIdx].ObjectiveBailUntil = 0.0;
+            }
         }
     }
     ConsolidateFireteams();
+    // AUDIT_3B Step 5: death releases + re-samples surviving members' slots.
+    SampleSquadSlots(GroupIdx);
 }
 
 function DemoteGroupLeader(KF2Bot OldLeader)
@@ -981,6 +1045,7 @@ function DemoteGroupLeader(KF2Bot OldLeader)
         NewLeader.bIsGroupLeader = true;
         NewLeader.ResetStuckState();
         Fireteams[GroupIdx].Leader = NewLeader;
+        InheritSquadOrder(GroupIdx, NewLeader);
     }
     ConsolidateFireteams();
 }
@@ -1224,13 +1289,20 @@ function CheckWave()
             EndObjective();
         }
     }
+    // AUDIT_3B Step 5: squad phase Enroute/Holding transitions (1s poll).
+    EvaluateSquadPhase();
     //return;    
 }
 
 final function SetHoldObjective(Volume V)
 {
     local NavigationPoint N;
+    local NavigationPoint GP;
+    local int i;
 
+    // R7a: clear stale points BEFORE appending so an A->B objective swap
+    // never leaves zone-A nav points reachable as goals (append-only bug).
+    ValidPoints.Length = 0;
     // End:0x76
     foreach WorldInfo.AllNavigationPoints(Class'Engine.NavigationPoint', N)
     {
@@ -1241,15 +1313,75 @@ final function SetHoldObjective(Volume V)
         }        
     }    
     bObjectiveActive = ValidPoints.Length != 0;
+
+    // AUDIT_3B Step 3: one shared SquadOrder per squad instead of each bot
+    // rolling an independent random point; leader goal = nearest in-zone
+    // nav point to the leader (slot sampling re-anchors this in Step 5).
+    if (bObjectiveActive)
+    {
+        EnsureSquadOrderTable();
+        for (i = 0; i < SquadOrders.Length; i++)
+        {
+            SquadOrders[i].Zone = HoldVolume;
+            SquadOrders[i].SquadID = i + 1;
+            SquadOrders[i].NodeBlacklist.Length = 0;
+            SquadOrders[i].ObjectiveBailUntil = 0.0;
+            if (SquadOrders[i].Leader != None && SquadOrders[i].Leader.Pawn != None)
+            {
+                GP = NearestValidPoint(SquadOrders[i].Leader.Pawn.Location);
+                if (GP != none)
+                {
+                    SquadOrders[i].GoalNav = GP;
+                    SquadOrders[i].GoalPoint = GP.Location;
+                    SquadOrders[i].Phase = PHASE_ENROUTE;
+                    SquadOrders[i].StartTime = WorldInfo.TimeSeconds;
+                    SquadOrders[i].SquadSeedAngle = FRand() * 6.2831855;
+                    EchelonLog("ORDER_CREATED squad=" $ string(i + 1) $ " goal=" $ CoordStr(SquadOrders[i].GoalPoint));
+                    SampleSquadSlots(i);
+                }
+            }
+            else
+            {
+                SquadOrders[i].GoalNav = none;
+                SquadOrders[i].GoalPoint = vect(0, 0, 0);
+                SquadOrders[i].Phase = PHASE_IDLE;
+            }
+        }
+    }
     //return;    
 }
 
 final function EndObjective()
 {
     local KF2Bot B;
+    local int i;
 
     bObjectiveActive = false;
     ValidPoints.Length = 0;
+    // AUDIT_3B Step 3: release every squad order; clear each squad's
+    // per-bot node blacklist (whole table, per R7a).
+    for (i = 0; i < SquadOrders.Length; i++)
+    {
+        ReleaseSquadSlots(i, "EndObjective");
+        SquadOrders[i].Leader = None;
+        SquadOrders[i].Zone = None;
+        SquadOrders[i].GoalNav = none;
+        SquadOrders[i].GoalPoint = vect(0, 0, 0);
+        SquadOrders[i].Slots.Length = 0;
+        SquadOrders[i].NodeBlacklist.Length = 0;
+        SquadOrders[i].ObjectiveBailUntil = 0.0;
+        // AUDIT_3B Step 7: objective ended while the squad still has members
+        // -> Regroup immediately (re-anchor) instead of limbo on PHASE_IDLE.
+        if (Fireteams[i].Members.Length > 0)
+        {
+            SquadOrders[i].Phase = PHASE_REGROUP;
+            SquadOrders[i].StartTime = WorldInfo.TimeSeconds;
+        }
+        else
+        {
+            SquadOrders[i].Phase = PHASE_IDLE;
+        }
+    }
     // End:0x6C
     foreach WorldInfo.AllControllers(Class'KF2Bots.KF2Bot', B)
     {
@@ -1258,15 +1390,678 @@ final function EndObjective()
     //return;    
 }
 
+// AUDIT_3B Step 3: nearest in-zone nav point to a location.
+function NavigationPoint NearestValidPoint(vector Loc)
+{
+    local int i;
+    local NavigationPoint N, Best;
+    local float BestDistSq, DistSq;
+
+    Best = none;
+    BestDistSq = 9999999999.0;
+    for (i = 0; i < ValidPoints.Length; i++)
+    {
+        N = ValidPoints[i];
+        if (N == none) continue;
+        DistSq = VSizeSq(N.Location - Loc);
+        if (DistSq < BestDistSq)
+        {
+            BestDistSq = DistSq;
+            Best = N;
+        }
+    }
+    return Best;
+}
+
+function string CoordStr(vector L)
+{
+    return string(FFloor(L.X / 100.0)) $ "," $ string(FFloor(L.Y / 100.0)) $ "," $ string(FFloor(L.Z / 100.0));
+}
+
+// AUDIT_3B Step 3: keep SquadOrders size-locked to the live group table
+// (UE3 arrays grow on indexed access).
+function EnsureSquadOrderTable()
+{
+    local int i;
+
+    if (SquadOrders.Length == Fireteams.Length) return;
+    for (i = SquadOrders.Length; i < Fireteams.Length; i++)
+    {
+        SquadOrders[i].SquadID = i + 1;
+        SquadOrders[i].Leader = None;
+        SquadOrders[i].Zone = None;
+        SquadOrders[i].GoalNav = none;
+        SquadOrders[i].GoalPoint = vect(0, 0, 0);
+        SquadOrders[i].Phase = PHASE_IDLE;
+    }
+}
+
+// AUDIT_3B 2.1: INHERIT succession. The successor keeps the squad's
+// Zone/GoalPoint/Slots/Phase; only the shared bail window resets. GoalPoint
+// is re-validated against the zone; an invalid goal triggers a re-sample
+// at the new leader's position (full slot re-claim lands in Step 5).
+function InheritSquadOrder(int GroupIdx, KF2Bot NewLeader)
+{
+    local SquadOrder O;
+    local NavigationPoint GP;
+    local int GoalKept;
+
+    if (NewLeader == None || NewLeader.Pawn == None) return;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return;
+
+    O = SquadOrders[GroupIdx];
+    if (O.GoalNav == none)
+    {
+        O.Leader = NewLeader;
+        O.Phase = PHASE_IDLE;
+        O.ObjectiveBailUntil = 0.0;
+        SquadOrders[GroupIdx] = O;
+        return;
+    }
+
+    O.Leader = NewLeader;
+    O.ObjectiveBailUntil = 0.0;
+    GoalKept = 1;
+    if (O.Zone != none && !O.Zone.EncompassesPoint(O.GoalPoint))
+    {
+        GP = NearestValidPoint(NewLeader.Pawn.Location);
+        if (GP != none)
+        {
+            O.GoalNav = GP;
+            O.GoalPoint = GP.Location;
+            GoalKept = 0;
+        }
+    }
+    SquadOrders[GroupIdx] = O;
+    if (O.GoalNav != none)
+    {
+        // Leader change = full re-claim (2.2 claim/release table).
+        SampleSquadSlots(GroupIdx);
+    }
+    EchelonLog("ORDER_INHERIT squad=" $ string(GroupIdx + 1) $ " newLeader=" $ string(NewLeader.Name) $ " goalKept=" $ string(GoalKept));
+}
+
+// AUDIT_3B Step 5 (2.2): angular-spread + farthest-point slot sampling.
+// Slot index == angular (sampling) index; filtered-out indices stay unset
+// and their followers keep the leader-anchored FollowNav ring.
+function SampleSquadSlots(int GroupIdx)
+{
+    local SquadOrder O;
+    local KF2Bot Ldr, M;
+    local vector LeaderLoc, Candidate;
+    local array<vector> Candidates;
+    local array<bool> bAlive;
+    local float Angle, R0, DMin, Dist, BestDist;
+    local int N, i, j, BestIdx;
+
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return;
+    if (GroupIdx >= Fireteams.Length) return;
+
+    O = SquadOrders[GroupIdx];
+    Ldr = O.Leader;
+    if (Ldr == None || Ldr.Pawn == None || O.GoalNav == none) return;
+
+    ReleaseSquadSlots(GroupIdx, "Resample");
+
+    LeaderLoc = Ldr.Pawn.Location;
+
+    // Follower count mirrors SyncSquadLeaders' slot-assignment order
+    // (member array order, leader skipped).
+    N = 0;
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        if (Fireteams[GroupIdx].Members[i] == None) continue;
+        if (Fireteams[GroupIdx].Members[i] == Ldr) continue;
+        N++;
+    }
+    if (N > 4) N = 4;
+    if (N <= 0) return;
+
+    O.Slots.Length = 0;
+    O.SlotLocs.Length = 0;
+
+    R0 = 96.0;
+    for (i = 0; i < N; i++)
+    {
+        Angle = O.SquadSeedAngle + (float(i) * 6.2831855 / float(N));
+        Candidate.X = O.GoalPoint.X + Cos(Angle) * R0;
+        Candidate.Y = O.GoalPoint.Y + Sin(Angle) * R0;
+        Candidate.Z = O.GoalPoint.Z;
+        Candidates.AddItem(Candidate);
+        bAlive.AddItem(true);
+    }
+
+    // Filters: inside zone, |dz| vs leader < 50u. Per-bot NodeBlacklist
+    // blocks apply at the path level (Step 4b), not to slot geometry.
+    for (i = 0; i < N; i++)
+    {
+        if (O.Zone != none && !O.Zone.EncompassesPoint(Candidates[i]))
+        {
+            bAlive[i] = false;
+        }
+        if (Abs(Candidates[i].Z - LeaderLoc.Z) >= 50.0)
+        {
+            bAlive[i] = false;
+        }
+    }
+
+    // Farthest-point pass: each pick maximizes the min distance to
+    // already-chosen slots + GoalPoint (prevents ring collapse).
+    BestDist = 0.0;
+    while (true)
+    {
+        BestIdx = INDEX_NONE;
+        for (i = 0; i < N; i++)
+        {
+            if (!bAlive[i]) continue;
+            DMin = VSize(Candidates[i] - O.GoalPoint);
+            for (j = 0; j < O.SlotLocs.Length; j++)
+            {
+                Dist = VSize(Candidates[i] - O.SlotLocs[j]);
+                if (Dist < DMin) DMin = Dist;
+            }
+            if (BestIdx == INDEX_NONE || DMin > BestDist)
+            {
+                BestDist = DMin;
+                BestIdx = i;
+            }
+        }
+        if (BestIdx == INDEX_NONE) break;
+        if (BestIdx >= O.SlotLocs.Length)
+        {
+            O.SlotLocs.Length = BestIdx + 1;
+        }
+        O.SlotLocs[BestIdx] = Candidates[BestIdx];
+        O.Slots.AddItem(BestIdx);
+        bAlive[BestIdx] = false;
+        BestDist = 0.0;
+    }
+    SquadOrders[GroupIdx] = O;
+
+    for (j = 0; j < O.Slots.Length; j++)
+    {
+        M = GetFollowerBySlot(GroupIdx, O.Slots[j]);
+        if (M == None) continue;
+        EchelonLog("SLOT_CLAIM bot=" $ string(M.Name) $ " squad=" $ string(GroupIdx + 1) $ " slot=" $ string(O.Slots[j]) $ " angle=" $ string(Atan2(Candidates[O.Slots[j]].Y - O.GoalPoint.Y, Candidates[O.Slots[j]].X - O.GoalPoint.X) * 57.2957795) $ " dist=" $ string(VSize(Candidates[O.Slots[j]] - O.GoalPoint)));
+    }
+}
+
+// AUDIT_3B Step 5: release all claimed slots (death/bail/leader change/
+// EndObjective), logging SLOT_RELEASE per occupant.
+function ReleaseSquadSlots(int GroupIdx, string Reason)
+{
+    local SquadOrder O;
+    local KF2Bot M;
+    local int j;
+
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return;
+    O = SquadOrders[GroupIdx];
+    for (j = 0; j < O.Slots.Length; j++)
+    {
+        M = GetFollowerBySlot(GroupIdx, O.Slots[j]);
+        if (M != None)
+        {
+            EchelonLog("SLOT_RELEASE bot=" $ string(M.Name) $ " squad=" $ string(GroupIdx + 1) $ " slot=" $ string(O.Slots[j]) $ " reason=" $ Reason);
+        }
+    }
+    O.Slots.Length = 0;
+    O.SlotLocs.Length = 0;
+    SquadOrders[GroupIdx] = O;
+}
+
+// AUDIT_3B Step 5: mirrors SyncSquadLeaders' slot-assignment order
+// (member array order, leader skipped).
+function KF2Bot GetFollowerBySlot(int GroupIdx, int SlotIdx)
+{
+    local int i, FollowerSlot;
+    local KF2Bot M;
+
+    if (GroupIdx < 0 || GroupIdx >= Fireteams.Length) return None;
+    FollowerSlot = 0;
+    for (i = 0; i < Fireteams[GroupIdx].Members.Length; i++)
+    {
+        M = Fireteams[GroupIdx].Members[i];
+        if (M == None || M == Fireteams[GroupIdx].Leader) continue;
+        if (FollowerSlot == SlotIdx) return M;
+        FollowerSlot++;
+    }
+    return None;
+}
+
+// AUDIT_3B Step 5: the squad order phase for a bot (0 if unassigned).
+function int GetSquadPhase(KF2Bot B)
+{
+    local int GroupIdx;
+
+    if (B == None) return 0;
+    GroupIdx = B.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return 0;
+    return SquadOrders[GroupIdx].Phase;
+}
+
+// AUDIT_3B Step 5: true while the squad order is Enroute or Holding —
+// the phases in which the follower ring anchors to the GoalPoint slot
+// instead of the leader's live position (model b).
+function bool IsSquadInObjectivePhase(KF2Bot B)
+{
+    local int GroupIdx;
+
+    if (B == None) return false;
+    GroupIdx = B.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return false;
+    return (SquadOrders[GroupIdx].Phase == PHASE_ENROUTE) || (SquadOrders[GroupIdx].Phase == PHASE_HOLDING);
+}
+
+// AUDIT_3B Step 5: the bot's claimed slot position around the squad
+// GoalPoint, or vect(0,0,0) when no slot is claimed.
+function vector GetSlotLocation(KF2Bot B)
+{
+    local int GroupIdx, SlotIdx;
+
+    if (B == None) return vect(0, 0, 0);
+    GroupIdx = B.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return vect(0, 0, 0);
+    SlotIdx = B.FollowSlotIndex;
+    if (SlotIdx < 0 || SlotIdx >= SquadOrders[GroupIdx].SlotLocs.Length) return vect(0, 0, 0);
+    return SquadOrders[GroupIdx].SlotLocs[SlotIdx];
+}
+
+// AUDIT_3B Step 5 (2.2 arrival): Enroute -> Holding when the leader and
+// >= 1 member have arrived; Holding -> Enroute when the leader leaves.
+// Runs on the 1s CheckWave poll; zone membership via Encompasses (actor).
+function EvaluateSquadPhase()
+{
+    local SquadOrder O;
+    local KF2Bot M;
+    local vector GoalLoc;
+    local float GoalRadiusSq, DistSq;
+    local bool LeaderInside, MemberInside;
+    local int i, MemberIdx;
+
+    if (WorldInfo == None || !bObjectiveActive) return;
+    GoalRadiusSq = 9216.0;   // 96^2, point-goal arrival band
+
+    for (i = 0; i < SquadOrders.Length; i++)
+    {
+        if (i >= Fireteams.Length) break;
+        O = SquadOrders[i];
+        if (O.Leader == None || O.Leader.Pawn == None) continue;
+        if (O.Phase != PHASE_ENROUTE && O.Phase != PHASE_HOLDING) continue;
+
+        if (O.Zone != none)
+        {
+            LeaderInside = O.Zone.Encompasses(O.Leader.Pawn);
+        }
+        else
+        {
+            GoalLoc = O.GoalPoint;
+            DistSq = VSizeSq(O.Leader.Pawn.Location - GoalLoc);
+            LeaderInside = DistSq < GoalRadiusSq;
+        }
+
+        MemberInside = false;
+        for (MemberIdx = 0; MemberIdx < Fireteams[i].Members.Length; MemberIdx++)
+        {
+            M = Fireteams[i].Members[MemberIdx];
+            if (M == None || M == O.Leader) continue;
+            if (M.Pawn == None || M.Pawn.Health <= 0) continue;
+            if (O.Zone != none)
+            {
+                if (O.Zone.Encompasses(M.Pawn)) MemberInside = true;
+            }
+            else
+            {
+                if (VSizeSq(M.Pawn.Location - O.GoalPoint) < GoalRadiusSq) MemberInside = true;
+            }
+        }
+
+        if (O.Phase == PHASE_ENROUTE && LeaderInside && MemberInside)
+        {
+            O.Phase = PHASE_HOLDING;
+            SquadOrders[i] = O;
+        }
+        else if (O.Phase == PHASE_HOLDING && !LeaderInside)
+        {
+            O.Phase = PHASE_ENROUTE;
+            SquadOrders[i] = O;
+        }
+    }
+}
+
+// AUDIT_3B Step 6: idle-watchdog hub support.
+
+// True when the bot's squad still has an active goal (order not abandoned).
+function bool HasSquadGoal(KF2Bot B)
+{
+    local int G;
+    // SquadOrders is indexed 0-based; GroupID is 1-based.
+    if (B == None || B.GroupID - 1 < 0 || B.GroupID - 1 >= SquadOrders.Length)
+    {
+        return false;
+    }
+    G = B.GroupID - 1;
+    return (SquadOrders[G].GoalNav != None && SquadOrders[G].GoalPoint != vect(0, 0, 0));
+}
+
+// Step 6, escalation 1: reset the bail window and re-sample the slots so the
+// squad re-commits to a fresh arrival pattern.
+function ReissueSquadOrder(KF2Bot B)
+{
+    local int G;
+    local SquadOrder O;
+    // SquadOrders is indexed 0-based; GroupID is 1-based.
+    if (B == None || B.GroupID - 1 < 0 || B.GroupID - 1 >= SquadOrders.Length)
+    {
+        return;
+    }
+    G = B.GroupID - 1;
+    O = SquadOrders[G];
+    O.ObjectiveBailUntil = 0.0;
+    SquadOrders[G] = O;
+    SampleSquadSlots(G);
+    EchelonLog("ORDER_REISSUE group=" $ string(G + 1) $ " leader=" $ string(B.Name));
+}
+
+// Step 6, escalation 2: nearest active leader (bot group leader or live
+// human with a player controller), within MaxDist of B. Returns None when
+// nobody qualifies.
+function Controller FindNearestActiveLeader(KF2Bot B, float MaxDist)
+{
+    local int i;
+    local KF2Bot Cand;
+    local KF2BotsMut.CachedHumanInfo CH;
+    local KFPawn_Human CandH;
+    local float BestD2, D2;
+    local Controller BestCtrl;
+
+    if (B == None || B.Pawn == None)
+    {
+        return None;
+    }
+    BestD2 = MaxDist * MaxDist;
+    BestCtrl = None;
+    for (i = 0; i < Fireteams.Length; i++)
+    {
+        Cand = Fireteams[i].Leader;
+        if (Cand != None && Cand != B && Cand.Pawn != None && Cand.Pawn.Health > 0)
+        {
+            D2 = VSizeSq(Cand.Pawn.Location - B.Pawn.Location);
+            if (D2 < BestD2)
+            {
+                BestD2 = D2;
+                BestCtrl = Cand;
+            }
+        }
+    }
+    for (i = 0; i < CachedHumans.Length; i++)
+    {
+        CH = CachedHumans[i];
+        CandH = CH.HumanPawn;
+        if (CandH != None && CandH.IsAliveAndWell() && PlayerController(CandH.Controller) != None)
+        {
+            D2 = VSizeSq(CH.Loc - B.Pawn.Location);
+            if (D2 < BestD2)
+            {
+                BestD2 = D2;
+                BestCtrl = CandH.Controller;
+            }
+        }
+    }
+    return BestCtrl;
+}
+
+// AUDIT_3B Step 7: live zed count within Radius of Origin.
+function int CountZedsInRadius(vector Origin, float Radius)
+{
+    local int Count;
+    local KFPawn_Monster Zed;
+
+    Count = 0;
+    foreach DynamicActors(class'KFPawn_Monster', Zed)
+    {
+        if (Zed.IsAliveAndWell() && VSizeSq(Zed.Location - Origin) <= Radius * Radius)
+        {
+            Count++;
+        }
+    }
+    return Count;
+}
+
+// AUDIT_3B Step 7: regroup entry evaluation (runs on the 3s macro tick).
+//   1) Leader dead/missing with live members -> promote successor, inherit
+//      the order, re-sample slots, Phase -> REGROUP. The dead leader stays in
+//      Members: the controller persists through Possess -> Restart, so the
+//      respawned leader re-joins the same squad with no re-registration (R8
+//      precondition verified).
+//   2) Idle leader (no goal, no zeds in REGROUP_SCAN_RADIUS, idle >= 3s)
+//      -> Phase -> REGROUP.
+function EvaluateRegroupEntries()
+{
+    local int i;
+    local SquadOrder O;
+    local KF2Bot Leader, NewLeader;
+    local bool bLeaderDead, bNoGoal, bIdleNow;
+    local float Now;
+
+    if (Fireteams.Length == 0) return;
+    EnsureSquadOrderTable();
+    if (SquadIdleStamp.Length != SquadOrders.Length)
+        SquadIdleStamp.Length = SquadOrders.Length;
+    Now = WorldInfo.TimeSeconds;
+
+    for (i = 0; i < Fireteams.Length; i++)
+    {
+        Leader = Fireteams[i].Leader;
+        bLeaderDead = (Leader == None || Leader.Pawn == None || Leader.Pawn.Health <= 0);
+        if (bLeaderDead)
+        {
+            if (Fireteams[i].Members.Length > 0)
+            {
+                NewLeader = FindBestCandidate(Fireteams[i].Members);
+                if (NewLeader != None)
+                {
+                    Fireteams[i].Leader = NewLeader;
+                    NewLeader.bIsGroupLeader = true;
+                    NewLeader.BotRank = SQUAD_LEADER;
+                    NewLeader.ResetStuckState();
+                    InheritSquadOrder(i, NewLeader);
+                    SampleSquadSlots(i);
+                    O = SquadOrders[i];
+                    O.Phase = PHASE_REGROUP;
+                    O.StartTime = Now;
+                    SquadOrders[i] = O;
+                    EchelonLog("REGROUP_ENTER squad=" $ string(i + 1) $ " leaderDead newLeader=" $ string(NewLeader.Name));
+                    SyncSquadLeaders();
+                }
+            }
+            continue;
+        }
+
+        bNoGoal = !HasSquadGoal(Leader);
+        bIdleNow = Leader.IsInState('PickNextMove') || Leader.IsInState('Camp') || Leader.IsInState('Roaming');
+        if (bNoGoal && bIdleNow && SquadIdleStamp[i] == 0.0)
+        {
+            SquadIdleStamp[i] = Now;
+        }
+        else if (!(bNoGoal && bIdleNow))
+        {
+            SquadIdleStamp[i] = 0.0;
+        }
+        if (bNoGoal && bIdleNow && SquadIdleStamp[i] > 0.0
+            && Now - SquadIdleStamp[i] >= 3.0
+            && CountZedsInRadius(Leader.Pawn.Location, REGROUP_SCAN_RADIUS) == 0)
+        {
+            O = SquadOrders[i];
+            O.Phase = PHASE_REGROUP;
+            O.StartTime = Now;
+            SquadOrders[i] = O;
+            SquadIdleStamp[i] = 0.0;
+            EchelonLog("REGROUP_ENTER squad=" $ string(i + 1) $ " leaderIdle leader=" $ string(Leader.Name));
+        }
+    }
+}
+
+// AUDIT_3B Step 7: the SquadOrder entry start time for the bot's squad.
+function float GetSquadStartTime(KF2Bot B)
+{
+    local int GroupIdx;
+
+    if (B == None) return 0.0;
+    GroupIdx = B.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return 0.0;
+    return SquadOrders[GroupIdx].StartTime;
+}
+
+// AUDIT_3B Step 7: inter-squad attach/merge. Moves every member of the From
+// squad into the To squad; the From squad becomes a ghost entry (Leader
+// None, 0 members). ConsolidateFireteams (which SyncSquadLeaders inside)
+// re-points every moved bot's SquadLeader to the To leader.
+function int MoveSquadMembers(int FromIdx, int ToIdx)
+{
+    local int MemberIdx;
+    local SquadOrder O;
+    local KF2Bot M;
+
+    if (FromIdx == ToIdx) return 0;
+    if (FromIdx < 0 || FromIdx >= Fireteams.Length || ToIdx < 0 || ToIdx >= Fireteams.Length)
+        return 0;
+
+    O = SquadOrders[FromIdx];
+    O.Phase = PHASE_IDLE;
+    SquadOrders[FromIdx] = O;
+
+    for (MemberIdx = 0; MemberIdx < Fireteams[FromIdx].Members.Length; MemberIdx++)
+    {
+        M = Fireteams[FromIdx].Members[MemberIdx];
+        if (M == None) continue;
+        ReassignBotToGroup(M, ToIdx);
+        // Hub contact stamp: the hub just moved this member.
+        M.WdLastHubContactTime = WorldInfo.TimeSeconds;
+    }
+    Fireteams[FromIdx].Leader = None;
+    Fireteams[FromIdx].Anchor = None;
+
+    O = SquadOrders[ToIdx];
+    O.Leader = Fireteams[ToIdx].Leader;
+    O.StartTime = WorldInfo.TimeSeconds;
+    SquadOrders[ToIdx] = O;
+
+    ConsolidateFireteams();
+    return Fireteams[ToIdx].Members.Length;
+}
+
 final function NavigationPoint GetBotObjective(KF2Bot B)
 {
+    local int GroupIdx, i;
+    local SquadOrder O;
+    local float BestDistSq, DistSq;
+    local NavigationPoint Best;
+
     // End:0x11
     if(!bObjectiveActive)
     {
         return none;
     }
+    if (B == None || B.Pawn == None)
+    {
+        return ValidPoints[Rand(ValidPoints.Length)];
+    }
+
+    // AUDIT_3B Step 3: return the caller's squad GoalPoint (shared by the
+    // whole squad) instead of an independent random pick.
+    EnsureSquadOrderTable();
+    GroupIdx = B.GroupID - 1;
+    if (GroupIdx >= 0 && GroupIdx < SquadOrders.Length)
+    {
+        O = SquadOrders[GroupIdx];
+        if (O.Leader != None && O.GoalNav != none)
+        {
+            return O.GoalNav;
+        }
+    }
+
+    // Fallback: nearest active squad's goal, else legacy random pick
+    // (preserved as the leaderless/unassigned stub behavior).
+    Best = none;
+    BestDistSq = 9999999999.0;
+    for (i = 0; i < SquadOrders.Length; i++)
+    {
+        O = SquadOrders[i];
+        if (O.Leader == None || O.Leader.Pawn == None || O.GoalNav == none) continue;
+        DistSq = VSizeSq(O.Leader.Pawn.Location - B.Pawn.Location);
+        if (DistSq < BestDistSq)
+        {
+            BestDistSq = DistSq;
+            Best = O.GoalNav;
+        }
+    }
+    if (Best != none)
+    {
+        return Best;
+    }
     return ValidPoints[Rand(ValidPoints.Length)];
     //return ReturnValue;    
+}
+
+// AUDIT_3B Step 4b: owner-only nav-node blacklist (path-level enforcement).
+// An entry blocks ONLY its owner and expires after OBJ_BAIL_COOLDOWN (8s);
+// the whole table is cleared on EndObjective. One unexpired entry per
+// (owner, node): re-failing the same node refreshes the expiry instead of
+// stacking entries.
+function bool IsNodeBlocked(KF2Bot OwnerBot, NavigationPoint Node)
+{
+    local int GroupIdx, i;
+    local SquadOrder O;
+    local float Now;
+
+    if (OwnerBot == None || Node == none) return false;
+    GroupIdx = OwnerBot.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return false;
+    Now = WorldInfo.TimeSeconds;
+    O = SquadOrders[GroupIdx];
+    for (i = 0; i < O.NodeBlacklist.Length; i++)
+    {
+        if (O.NodeBlacklist[i].Owner != OwnerBot) continue;
+        if (O.NodeBlacklist[i].Node != Node.Name) continue;
+        if (O.NodeBlacklist[i].ExpiresAt > Now) return true;
+    }
+    return false;
+}
+
+function AddNodeBlock(KF2Bot OwnerBot, NavigationPoint Node)
+{
+    local int GroupIdx, i;
+    local SquadOrder O;
+    local NavNodeBlock B;
+    local float Now;
+
+    if (OwnerBot == None || Node == none) return;
+    GroupIdx = OwnerBot.GroupID - 1;
+    if (GroupIdx < 0 || GroupIdx >= SquadOrders.Length) return;
+    Now = WorldInfo.TimeSeconds;
+    O = SquadOrders[GroupIdx];
+    // Prune expired entries so the table never grows unbounded.
+    for (i = O.NodeBlacklist.Length - 1; i >= 0; i--)
+    {
+        if (O.NodeBlacklist[i].ExpiresAt <= Now)
+        {
+            O.NodeBlacklist.Remove(i, 1);
+        }
+    }
+    for (i = 0; i < O.NodeBlacklist.Length; i++)
+    {
+        if (O.NodeBlacklist[i].Owner == OwnerBot && O.NodeBlacklist[i].Node == Node.Name)
+        {
+            O.NodeBlacklist[i].ExpiresAt = Now + OBJ_BAIL_COOLDOWN;
+            SquadOrders[GroupIdx] = O;
+            return;
+        }
+    }
+    B.Node = Node.Name;
+    B.Owner = OwnerBot;
+    B.ExpiresAt = Now + OBJ_BAIL_COOLDOWN;
+    O.NodeBlacklist.AddItem(B);
+    SquadOrders[GroupIdx] = O;
 }
 
 final function InitTraderList(KFGFxObject_TraderItems L)
